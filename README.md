@@ -200,6 +200,18 @@ The Telethon session lives in the `TG_SESSION` variable, because a `.session`
 file on the container disk would be wiped by every deploy. Treat it like a
 password.
 
+**Only one process may use a session at a time.** If the same `TG_SESSION`
+connects from two IPs at once, Telegram revokes it for good
+(`AuthKeyDuplicatedError`) and you have to log in again. Railway starts a new
+container before stopping the old one, so the bot takes a Postgres advisory
+lock per `TG_ACCOUNT` before connecting to Telegram: a new deploy waits until
+the old process has exited. That covers deploys and anything else pointed at
+the same database. It cannot cover a copy running against a *different*
+database — never run the bot locally with the production session.
+
+If the session does die, the bot messages every admin in Telegram with what to
+do, at most once an hour, using the admin ids resolved on its last good start.
+
 ## Deploying
 
 Railway project `tg-message-sender-bot`: `Postgres` plus a `bot` service built

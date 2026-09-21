@@ -141,6 +141,25 @@ async def main() -> None:
         assert sum(by.values()) == 2, "breakdown excludes people already invited"
         ok("nobody is invited twice; counts agree")
 
+        # ---------------- one live instance per Telegram session ----------------
+        dsn = normalize_dsn(DSN)
+        first = await db.acquire_instance_lock(dsn)
+        waits = []
+        second_task = asyncio.create_task(
+            db.acquire_instance_lock(dsn, on_wait=waits.append, poll=0.1)
+        )
+        for _ in range(100):            # connecting over the public proxy takes a while
+            if waits or second_task.done():
+                break
+            await asyncio.sleep(0.1)
+        assert waits and not second_task.done(), "a second instance must wait"
+        other_scope = await other.acquire_instance_lock(dsn)
+        await other_scope.close()   # a different account is not blocked
+        await first.close()          # the old deploy exits
+        second = await asyncio.wait_for(second_task, 5)
+        await second.close()
+        ok("instance lock: a second process waits until the first exits; other accounts don't")
+
         # ---------------- resume ----------------
         await db.release_inflight(cid2)
         await db.finish_campaign(cid2, "stopped", "manual")

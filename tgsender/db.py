@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import time
 from dataclasses import dataclass
 from typing import Any
@@ -122,6 +123,27 @@ class DB:
 
     async def close(self) -> None:
         await self.pool.close()
+
+    async def acquire_instance_lock(self, dsn: str, *, on_wait=None, poll: float = 2.0):
+        """Block until no other process holds this account's Telegram session.
+
+        Railway starts the new container before the old one is stopped. Two
+        processes connecting with the same TG_SESSION from different IPs make
+        Telegram revoke it (AuthKeyDuplicatedError). A Postgres advisory lock
+        held on a dedicated connection serialises them: the old process holds
+        it until it exits, and its connection closing releases it.
+
+        Returns the connection; keep it open for the life of the process.
+        """
+        conn = await asyncpg.connect(dsn)
+        key = f"tgsender:userbot:{self.account}"
+        waited = 0.0
+        while not await conn.fetchval("SELECT pg_try_advisory_lock(hashtext($1))", key):
+            if on_wait:
+                on_wait(waited)
+            await asyncio.sleep(poll)
+            waited += poll
+        return conn
 
     # ------------------------------------------------------------------ #
     # recipients

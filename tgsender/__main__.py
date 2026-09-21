@@ -4,11 +4,12 @@ import argparse
 import asyncio
 import logging
 import sys
+import time
 
 from aiogram import Bot, Dispatcher
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
-from telethon import TelegramClient
+from telethon import TelegramClient, errors
 from telethon.sessions import StringSession
 
 from . import config as config_mod
@@ -41,15 +42,39 @@ def _make_client(cfg: config_mod.Config) -> TelegramClient:
     return TelegramClient(session, cfg.api_id, cfg.api_hash)
 
 
+class UserbotAuthError(Exception):
+    """TG_SESSION cannot be used; a human has to make a new one."""
+
+
+SESSION_DEAD = (
+    errors.AuthKeyDuplicatedError,
+    errors.AuthKeyUnregisteredError,
+    errors.SessionRevokedError,
+    errors.SessionExpiredError,
+    errors.UserDeactivatedBanError,
+    errors.UserDeactivatedError,
+)
+
+
 async def _connect_userbot(cfg: config_mod.Config) -> TelegramClient:
     client = _make_client(cfg)
-    await client.connect()
-    if not await client.is_user_authorized():
+    try:
+        await client.connect()
+        authorised = await client.is_user_authorized()
+    except errors.AuthKeyDuplicatedError as exc:
+        raise UserbotAuthError(
+            "Telegram аннулировал TG_SESSION: сессию использовали одновременно с двух "
+            "разных IP (например, бот на Railway и запуск на компьютере, или два "
+            "контейнера при деплое). Эту сессию больше нельзя использовать."
+        ) from exc
+    except SESSION_DEAD as exc:
+        raise UserbotAuthError(
+            f"Сессия TG_SESSION больше не действует ({type(exc).__name__}): её завершили "
+            f"в настройках Telegram, она истекла или аккаунт заблокирован."
+        ) from exc
+    if not authorised:
         await client.disconnect()
-        raise SystemExit(
-            "The sending account is not authorised.\n"
-            "Run `python -m tgsender session` locally, then set TG_SESSION."
-        )
+        raise UserbotAuthError("TG_SESSION пустая или не авторизована.")
     me = await client.get_me()
     if me.bot:
         await client.disconnect()
@@ -136,9 +161,55 @@ async def cmd_session(cfg: config_mod.Config) -> int:
     return 0
 
 
+async def _alert_session_dead(cfg, db: DB, reason: str) -> None:
+    """Tell the admins in Telegram — they don't read Railway logs.
+
+    Uses the admin ids resolved on the last good start, since @usernames can't
+    be resolved without a working userbot. At most once an hour, so a restart
+    loop does not flood them.
+    """
+    stored = await db.get_settings()
+    last = float(stored.get("session_alert_at", 0) or 0)
+    if time.time() - last < 3600:
+        return
+    ids = set(cfg.admin_ids)
+    ids |= {int(i) for i in stored.get("admin_ids_resolved", "").split(",") if i.strip()}
+    if not ids:
+        return
+    bot = Bot(token=cfg.bot_token, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
+    text = (
+        "🔴 <b>Бот не может войти в аккаунт-отправитель.</b>\n\n"
+        f"{reason}\n\n"
+        "Что сделать:\n"
+        "1. На компьютере: <code>python -m tgsender session</code> — войти тем же номером.\n"
+        "2. Вставить новую строку в переменную <code>TG_SESSION</code> на Railway.\n"
+        "3. Не запускать бота с этой сессией нигде, кроме Railway.\n\n"
+        "Прогресс рассылок сохранён в базе — после входа нажмите «▶️ Продолжить»."
+    )
+    try:
+        for admin_id in sorted(ids):
+            try:
+                await bot.send_message(admin_id, text)
+            except Exception as exc:  # noqa: BLE001
+                log.warning("Could not alert %s: %s", admin_id, exc)
+    finally:
+        await bot.session.close()
+    await db.set_setting("session_alert_at", str(time.time()))
+
+
 async def cmd_run(cfg: config_mod.Config) -> int:
-    db = await DB.connect(config_mod.require_database_url(cfg), cfg.account)
+    dsn = config_mod.require_database_url(cfg)
+    db = await DB.connect(dsn, cfg.account)
     log.info("Postgres connected; account scope %r", cfg.account)
+
+    def waiting(seconds: float) -> None:
+        if seconds % 10 == 0:
+            log.info("Another instance still holds the Telegram session; waiting (%ds)",
+                     int(seconds))
+
+    # Never connect the userbot while a previous deploy is still connected.
+    instance_lock = await db.acquire_instance_lock(dsn, on_wait=waiting)
+    log.info("Instance lock acquired; this process owns the Telegram session")
     guessed = await db.backfill_gender()
     if guessed:
         log.info("Guessed gender for %s recipients collected earlier", guessed)
@@ -152,7 +223,14 @@ async def cmd_run(cfg: config_mod.Config) -> int:
         s.now().strftime("%H:%M"),
     )
 
-    client = await _connect_userbot(cfg)
+    try:
+        client = await _connect_userbot(cfg)
+    except UserbotAuthError as exc:
+        log.error("Userbot cannot log in: %s", exc)
+        await _alert_session_dead(cfg, db, str(exc))
+        await instance_lock.close()
+        await db.close()
+        raise SystemExit(f"Userbot cannot log in: {exc}") from exc
 
     bot = Bot(
         token=cfg.bot_token,
@@ -163,6 +241,8 @@ async def cmd_run(cfg: config_mod.Config) -> int:
     gate = AdminGate(cfg.admin_ids, cfg.admin_usernames)
     await _resolve_admin_usernames(client, gate)
     log.info("Admins: %s", gate.describe())
+    # Remembered so a later start with a dead session can still reach them.
+    await db.set_setting("admin_ids_resolved", ",".join(str(i) for i in sorted(gate.ids)))
 
     async def broadcast(text: str) -> None:
         for admin_id in sorted(gate.ids):
@@ -248,6 +328,7 @@ async def cmd_run(cfg: config_mod.Config) -> int:
             await asyncio.gather(worker.task, return_exceptions=True)
         await bot.session.close()
         await client.disconnect()
+        await instance_lock.close()
         await db.close()
     return 0
 

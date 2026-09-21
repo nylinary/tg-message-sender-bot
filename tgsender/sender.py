@@ -48,6 +48,8 @@ class SendWorker:
         self.multiplier = 1.0
         self.waiting_until: float | None = None
         self.wait_reason = ""
+        self.flood_waits = 0
+        self.stop_reason: str | None = None
         self._stop = asyncio.Event()
 
     @staticmethod
@@ -67,11 +69,18 @@ class SendWorker:
             raise RuntimeError("A campaign is already running")
         self.campaign_id = campaign_id
         self.multiplier = 1.0
+        self.flood_waits = 0
+        self.stop_reason = None
         self._stop = asyncio.Event()
         self.task = asyncio.create_task(self._run(campaign_id))
 
-    def request_stop(self) -> None:
+    def request_stop(self, reason: str | None = None) -> None:
+        self.stop_reason = reason
         self._stop.set()
+
+    @property
+    def stop_text(self) -> str:
+        return self.stop_reason or "Остановлено вручную"
 
     async def _sleep(self, seconds: float, reason: str) -> bool:
         """Sleep, but wake early if someone pressed Stop. False => stop."""
@@ -98,12 +107,11 @@ class SendWorker:
         parse_mode = campaign["parse_mode"]
         sent_in_run = 0
         recipient = None
-        stopped = "Остановлено вручную"
 
         try:
             while True:
                 if self._stop.is_set():
-                    return await self._finish(campaign_id, "stopped", stopped)
+                    return await self._finish(campaign_id, "stopped", self.stop_text)
 
                 # Settings are re-read every message, so changing the interval,
                 # jitter, timezone or deadline in the panel applies right away.
@@ -115,18 +123,18 @@ class SendWorker:
                 # in-flight, and holding one across a long sleep would strand
                 # them if the process died mid-wait.
                 if s.pause_at_night and not await self._wait_out_quiet_hours(s):
-                    return await self._finish(campaign_id, "stopped", stopped)
+                    return await self._finish(campaign_id, "stopped", self.stop_text)
 
                 if sent_in_run and sent_in_run % p.long_pause_every == 0:
                     pause = random.uniform(p.long_pause_min, p.long_pause_max)
                     if not await self._sleep(pause, "длинная пауза"):
-                        return await self._finish(campaign_id, "stopped", stopped)
+                        return await self._finish(campaign_id, "stopped", self.stop_text)
 
                 if sent_in_run:
                     gap = s.interval * self.multiplier
                     gap *= random.uniform(1 - s.jitter, 1 + s.jitter)
                     if not await self._sleep(gap, "интервал"):
-                        return await self._finish(campaign_id, "stopped", stopped)
+                        return await self._finish(campaign_id, "stopped", self.stop_text)
 
                 # The wait may have carried us past the deadline or into the night.
                 s = await settings_mod.load(self.db, self.cfg)
@@ -187,6 +195,7 @@ class SendWorker:
         except errors.FloodWaitError as exc:
             # Not this recipient's fault — put them back in the queue.
             await self.db.mark(campaign_id, recipient.user_id, "pending")
+            self.flood_waits += 1
             self.multiplier = min(
                 self.cfg.pacing.flood_backoff_max,
                 self.multiplier * self.cfg.pacing.flood_backoff,
@@ -204,7 +213,7 @@ class SendWorker:
             )
             # Resuming on the exact second the wait expires is itself a bot tell.
             if not await self._sleep(exc.seconds + random.uniform(10, 60), "FLOOD_WAIT"):
-                await self._finish(campaign_id, "stopped", "Остановлено вручную")
+                await self._finish(campaign_id, "stopped", self.stop_text)
                 return "hard_stop"
             return "retry"
         except ACCOUNT_ERRORS as exc:

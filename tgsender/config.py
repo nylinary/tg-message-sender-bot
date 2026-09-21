@@ -47,6 +47,8 @@ class Config:
     pacing: Pacing
     risk: Risk
     stale_after_hours: float
+    spam_every_hours: int
+    spam_notify: str
     database_url: str
     session_string: str | None
     session_path: Path
@@ -162,6 +164,8 @@ def load(config_path: Path | None = None) -> Config:
         pacing=Pacing(**raw["pacing"]),
         risk=Risk(**raw["risk"]),
         stale_after_hours=float(raw["collect"]["stale_after_hours"]),
+        spam_every_hours=int(raw.get("spamcheck", {}).get("every_hours", 6)),
+        spam_notify=raw.get("spamcheck", {}).get("notify", "always"),
         # Not required here: `session` runs before any database exists.
         # `run` validates it via require_database_url().
         database_url=normalize_dsn(os.environ.get("DATABASE_URL", "").strip()),

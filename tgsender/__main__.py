@@ -17,6 +17,7 @@ from .bot import AdminGate, Panel, router
 from .db import DB
 from .login import LoginError, interactive_login
 from .sender import SendWorker
+from .spamcheck import SpamWatch
 
 logging.basicConfig(
     level=logging.INFO,
@@ -163,6 +164,13 @@ async def cmd_run(cfg: config_mod.Config) -> int:
     await _resolve_admin_usernames(client, gate)
     log.info("Admins: %s", gate.describe())
 
+    async def broadcast(text: str) -> None:
+        for admin_id in sorted(gate.ids):
+            try:
+                await bot.send_message(admin_id, text)
+            except Exception as exc:  # noqa: BLE001 - a dead admin chat is not fatal
+                log.warning("Could not notify %s: %s", admin_id, exc)
+
     async def notify(event: str, **kw) -> None:
         """Push campaign lifecycle events to everyone with panel access."""
         if event == "finished":
@@ -177,14 +185,12 @@ async def cmd_run(cfg: config_mod.Config) -> int:
             )
         else:
             return
-        for admin_id in sorted(gate.ids):
-            try:
-                await bot.send_message(admin_id, text)
-            except Exception as exc:  # noqa: BLE001 - a dead admin chat is not fatal
-                log.warning("Could not notify %s: %s", admin_id, exc)
+        await broadcast(text)
 
     worker = SendWorker(cfg, db, client, on_event=notify)
-    panel = Panel(cfg=cfg, db=db, client=client, worker=worker)
+    spam = SpamWatch(cfg, db, client, worker, broadcast)
+    panel = Panel(cfg=cfg, db=db, client=client, worker=worker, spam=spam)
+    spam_task = asyncio.create_task(spam.loop())
 
     # A campaign the database still calls 'running' is not running — this
     # process just started. Recover it honestly so the panel offers Продолжить
@@ -234,7 +240,9 @@ async def cmd_run(cfg: config_mod.Config) -> int:
     try:
         await dp.start_polling(bot, panel=panel, handle_signals=False)
     finally:
-        worker.request_stop()
+        spam_task.cancel()
+        await asyncio.gather(spam_task, return_exceptions=True)
+        worker.request_stop("Процесс остановлен")
         if worker.task is not None:
             worker.task.cancel()
             await asyncio.gather(worker.task, return_exceptions=True)

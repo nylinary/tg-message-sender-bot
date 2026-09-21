@@ -21,6 +21,9 @@ from .config import Config
 MAX_INTERVAL = 6 * 3600
 MAX_JITTER = 0.9
 
+SPAM_NOTIFY_ALWAYS, SPAM_NOTIFY_PROBLEMS = "always", "problems"
+SPAM_EVERY_PRESETS = [0, 1, 3, 6, 12, 24]
+
 NIGHT_SILENT, NIGHT_PAUSE = "silent", "pause"
 NIGHT_MODES = {
     NIGHT_SILENT: "ночью отправлять без звука",
@@ -39,6 +42,8 @@ class Settings:
     jitter: float        # fraction, 0.35 = ±35%
     timezone: str
     night_mode: str = NIGHT_SILENT
+    spam_every_hours: int = 6
+    spam_notify: str = SPAM_NOTIFY_ALWAYS
 
     @property
     def pause_at_night(self) -> bool:
@@ -88,7 +93,15 @@ def resolve(raw: dict[str, str], cfg: Config) -> Settings:
     jitter = min(MAX_JITTER, max(0.0, number("jitter", cfg.pacing.jitter)))
     default_night = cfg.pacing.night_mode if cfg.pacing.night_mode in NIGHT_MODES else NIGHT_SILENT
     night = raw.get("night_mode") if raw.get("night_mode") in NIGHT_MODES else default_night
-    return Settings(wall.replace(tzinfo=tz), interval, jitter, timezone, night)
+    try:
+        every = int(float(raw.get("spam_every_hours", cfg.spam_every_hours)))
+    except ValueError:
+        every = cfg.spam_every_hours
+    every = max(0, min(168, every))
+    notify = raw.get("spam_notify") or cfg.spam_notify
+    if notify not in (SPAM_NOTIFY_ALWAYS, SPAM_NOTIFY_PROBLEMS):
+        notify = SPAM_NOTIFY_ALWAYS
+    return Settings(wall.replace(tzinfo=tz), interval, jitter, timezone, night, every, notify)
 
 
 async def load(db, cfg: Config) -> Settings:

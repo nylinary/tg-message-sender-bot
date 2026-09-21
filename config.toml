@@ -30,6 +30,13 @@ long_pause_max   = 240
 flood_backoff     = 1.5
 flood_backoff_max = 8.0
 
+[spamcheck]
+# Ask @SpamBot about the account every N hours (0 = only when you press the
+# button). notify: "always" reports every check, "problems" only when limited.
+# Both changeable from the bot.
+every_hours = 6
+notify      = "always"
+
 [risk]
 # Messages per day above which the panel warns. Advisory only.
 warn_per_day   = 300

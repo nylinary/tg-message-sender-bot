@@ -43,6 +43,7 @@ from tgsender.bot import AdminGate, Panel, router  # noqa: E402
 from tgsender.db import DB, Recipient  # noqa: E402
 from tgsender.filters import Filter  # noqa: E402
 from tgsender.sender import SendWorker  # noqa: E402
+from tgsender.spamcheck import SpamWatch  # noqa: E402
 
 ok = lambda m: print(f"  ok  {m}")
 cfg = config_mod.load()
@@ -349,6 +350,96 @@ async def main() -> None:
         await press("set:night")
         assert (await db.get_settings())["night_mode"] == "silent"
         ok("night: silent mode sends with silent=True at 02:00; pause mode sends nothing")
+
+        # ---------------- @SpamBot ----------------
+        # Back to midday so the campaign below is not paused for the night.
+        await db.set_setting("timezone", tz)
+        spambot = {"reply": "Good news, no limits are currently applied to your account."}
+        broadcasts = []
+
+        async def fake_ask(client):
+            return spambot["reply"]
+
+        async def broadcast(text):
+            broadcasts.append(text)
+
+        panel.spam = SpamWatch(cfg, db, userbot, worker, broadcast, ask=fake_ask)
+
+        await say("/start")
+        assert "@SpamBot: ещё не проверяли" in tg.last_screen() and "spam" in tg.last_markup()
+        await press("spam")
+        assert "ограничений нет" in tg.last_screen() and "✅" in tg.last_screen()
+        assert not broadcasts, "an all-clear from the button is not broadcast"
+        await say("/start")
+        assert "@SpamBot: ✅ ограничений нет" in tg.last_screen()
+        ok("🛡 button asks @SpamBot and the home screen remembers the verdict")
+
+        # A limit during a running campaign stops it.
+        cid = await db.create_campaign("x", None, Filter(), ADMIN, 60.0, exclude_sent=False)
+        await db.set_setting("interval", "600")
+        worker.start(cid)
+        for _ in range(30):
+            if userbot.sent and worker.waiting_until:
+                break
+            await asyncio.sleep(0.1)
+        spambot["reply"] = ("Your account is now limited until 28 Sep 2026, 14:02 UTC. "
+                            "You will not be able to send messages to non-contacts.")
+        await press("spam")
+        await asyncio.wait_for(worker.task, 5)
+        row = await db.get_campaign(cid)
+        assert row["status"] == "stopped" and "@SpamBot" in row["stop_reason"], dict(row)
+        screen = tg.last_screen()
+        assert "ОГРАНИЧЕН до 28 Sep 2026, 14:02 UTC" in screen and "остановлена" in screen
+        assert broadcasts and "остановлена автоматически" in broadcasts[-1], broadcasts
+        await say("/start")
+        assert "resume" in tg.last_markup(), "the stopped campaign can be resumed later"
+        ok("a limit found mid-campaign stops it, tells every admin, and stays resumable")
+        await db.set_setting("interval", "10")
+
+        # Schedule settings.
+        await press("set")
+        assert "каждые 6 ч, уведомлять всегда" in tg.last_screen()
+        await press("set:spam")
+        await press("set:spam:1")
+        await press("set:spamnotify")
+        stored = await db.get_settings()
+        assert stored["spam_every_hours"] == "1" and stored["spam_notify"] == "problems"
+        assert "каждые 1 ч, уведомлять только о проблемах" in tg.last_screen()
+        ok("schedule: every 1 h, notify only about problems — saved from the panel")
+
+        # The scheduler: not due, due-but-fine (quiet), limit (loud), cleared (loud).
+        watch = panel.spam
+        broadcasts.clear()
+        assert await watch.tick() <= 300 and not broadcasts, "checked just now → not due"
+        async def age_last_check(hours):
+            last = await watch.last()
+            last.checked_at -= hours * 3600
+            await db.set_setting("spam_last", last.to_json())
+
+        spambot["reply"] = "Good news, no limits are currently applied to your account."
+        await age_last_check(2)
+        await watch.tick()
+        assert (await watch.last()).state == "ok"
+        assert len(broadcasts) == 1 and "Ограничения сняты" in broadcasts[0], \
+            "first all-clear after a limit is announced even in problems-only mode"
+        await age_last_check(2)
+        await watch.tick()
+        assert len(broadcasts) == 1, "routine all-clear stays quiet in problems-only mode"
+        spambot["reply"] = "Your account is now limited until 1 Oct 2026."
+        await age_last_check(2)
+        await watch.tick()
+        assert len(broadcasts) == 2 and "ОГРАНИЧЕН" in broadcasts[-1]
+        await press("set:spamnotify")
+        spambot["reply"] = "Good news, no limits are currently applied to your account."
+        await age_last_check(2)
+        await watch.tick()
+        await age_last_check(2)
+        await watch.tick()
+        assert len(broadcasts) == 4, "notify-always reports every check"
+        await press("set:spam:0")
+        await age_last_check(100)
+        assert await watch.tick() == 300 and len(broadcasts) == 4, "off means off"
+        ok("scheduler: respects the interval, notify modes, recovery notice, and 'off'")
 
     finally:
         if worker.running:

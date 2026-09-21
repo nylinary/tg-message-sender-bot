@@ -22,6 +22,7 @@ Two Telegram identities, two different jobs:
  │                              └─ 📝 Разослать этим людям → текст → проверка
  ├─ ▶️ Продолжить #N          (если рассылка была остановлена)
  ├─ 📊 Статус  ·  ⚙️ Настройки
+ ├─ 🛡 Проверить аккаунт (@SpamBot)
  └─ 🔄 Пересканировать диалоги
 ```
 
@@ -86,6 +87,7 @@ running** — the sender re-reads them before every message.
 | 🎲 Джиттер | ±35% | Each pause is randomised: 180 s ±35% = 117–243 s |
 | 🌍 Часовой пояс | Europe/Moscow | Deadline and night hours are read in this zone |
 | 🌙 Ночью | без звука | 23:00–10:00: keep sending silently, or send nothing |
+| 🛡 Автопроверка @SpamBot | every 6 h, notify always | 0/1/3/6/12/24 h; notify always or only on problems |
 
 The deadline is stored as local wall-clock time, so «21:00» keeps meaning 21:00
 wherever you set the timezone.
@@ -115,6 +117,37 @@ metronome. Jitter varies each gap so the account's rhythm looks like a person
 working through a list. It does not raise throughput or get around any limit —
 the average pace is the same. What keeps an account safe is the pace itself
 and not being reported, which is why the defaults are slow.
+
+## 🛡 @SpamBot
+
+[@SpamBot](https://t.me/SpamBot) is Telegram's own account-status bot. The
+panel asks it on your behalf — the userbot sends `/start` and reads the reply —
+either when you press **🛡 Проверить аккаунт** or on a schedule.
+
+**What it can tell you:** the account's current state, and nothing else —
+
+| Verdict | Meaning |
+| --- | --- |
+| ✅ ограничений нет | Free to message anyone |
+| 🚨 ограничен до *date* | Temporary limit; usually "cannot message people who don't have your number" |
+| 🚨 ограничен (без срока) | Indefinite limit, until an appeal succeeds |
+
+**What it cannot:** how many people complained, or whether you are close to a
+limit. Telegram exposes neither, so there is no early "risk" reading to show.
+The earliest signals you do get are `FLOOD_WAIT`s (counted in each report) and
+`PEER_FLOOD`, which stops a campaign on the spot.
+
+**What the panel does with it:**
+
+- the last verdict is on the home screen, with its time;
+- a limit found while a campaign runs **stops the campaign** and tells every
+  admin — sending on from a limited account is what turns a temporary limit
+  into a permanent one. It stays resumable with ▶️ Продолжить;
+- scheduled checks report every time, or only on problems (a limit, or the
+  first all-clear after one).
+
+Checking is harmless: it is Telegram's official bot and one `/start` per hour
+is nothing. The chat with @SpamBot will appear in your chat list.
 
 ## The launch screen
 
@@ -157,7 +190,7 @@ comfortable around 200–300/day, and limits tend to land above 600/day.
 | `recipients` | Dialogue scan: who, when you last spoke, guessed gender |
 | `campaigns` | Text, filter, status, stop reason |
 | `deliveries` | One row per recipient per campaign: `pending` → `sending` → `sent` / `skipped` / `failed` |
-| `settings` | Deadline, interval, jitter, timezone, night mode |
+| `settings` | Deadline, interval, jitter, timezone, night mode, @SpamBot schedule and last verdict |
 
 Every delivery is committed as it happens. A redeploy loses at most the message
 in flight, and that is requeued on the next boot; the panel then offers
@@ -201,6 +234,7 @@ Anyone else is ignored silently.
 | `USER_PRIVACY_RESTRICTED` | Skip that person, continue |
 | Deadline passed | Stop before the next message; the rest stay resumable |
 | Night, silent mode | Message sent with `silent=True` — no sound on their phone |
+| @SpamBot reports a limit | Stop the campaign, notify every admin |
 
 Always on: silent or paused nights (23:00–10:00 in your timezone), and a
 longer pause every 60 messages.
@@ -241,4 +275,6 @@ throwaway account scopes and clean up after themselves.
 | `tgsender/settings.py` | Runtime settings and their parsing |
 | `tgsender/scheduling.py` | Pace, finish time and deadline arithmetic |
 | `tgsender/sender.py` | Send loop, error handling, backoff, deadline stop |
+| `tgsender/spamcheck.py` | @SpamBot check, verdict parsing, the schedule |
+| `tgsender/login.py` | `tgsender session`: phone normalisation, code and 2FA |
 | `tgsender/db.py` | Postgres schema and every state transition |

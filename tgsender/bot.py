@@ -23,6 +23,7 @@ from .filters import PERIOD_HELP, PRESETS, Filter, PeriodError, gender_button, p
 from .gender import FEMALE, ICONS, MALE, UNKNOWN
 from .scheduling import describe, estimate, humanize
 from .sender import SendWorker
+from .spamcheck import OK, SpamStatus
 from .settings import (
     INTERVAL_PRESETS,
     JITTER_PRESETS,
@@ -89,6 +90,7 @@ class Panel:
     db: DB
     client: TelegramClient
     worker: SendWorker
+    spam: object | None = None      # SpamWatch, absent in tests that don't need it
     scanning: bool = False
     scan_counts: dict = field(default_factory=dict)
 
@@ -206,6 +208,7 @@ async def main_menu(panel: Panel) -> InlineKeyboardMarkup:
             [("📊 Проверить статус", "status")],
             [("⏹ Остановить рассылку", "stop")],
             [("🔎 Посчитать получателей", "count")],
+            [("🛡 Проверить аккаунт (@SpamBot)", "spam")],
             [("⚙️ Настройки", "set")],
         )
     rows = [[("📝 Новая рассылка", "new")], [("🔎 Посчитать получателей", "count")]]
@@ -217,6 +220,7 @@ async def main_menu(panel: Panel) -> InlineKeyboardMarkup:
         )
     rows += [
         [("📊 Статус", "status"), ("⚙️ Настройки", "set")],
+        [("🛡 Проверить аккаунт (@SpamBot)", "spam")],
         [("🔄 Пересканировать диалоги", "rescan")],
     ]
     return kb(*rows)
@@ -232,9 +236,18 @@ async def home_text(panel: Panel) -> str:
         f"🏁 Дедлайн: <b>{s.deadline:%d.%m.%Y %H:%M}</b>\n"
         f"⏱ Интервал: <b>{humanize(s.interval)}</b> ±{s.jitter * 100:.0f}%\n"
         f"🌙 Ночью: {night_text(panel, s)}\n"
-        f"🌍 {s.timezone}, сейчас {s.now():%H:%M}\n\n"
+        f"🌍 {s.timezone}, сейчас {s.now():%H:%M}\n"
+        f"{await spam_line(panel, s)}\n\n"
         + ("🟢 Сейчас идёт рассылка." if panel.worker.running else "Готов к работе.")
     )
+
+
+async def spam_line(panel: Panel, s: settings_mod.Settings) -> str:
+    last = SpamStatus.from_json((await panel.db.get_settings()).get("spam_last"))
+    if last is None:
+        return "🛡 @SpamBot: ещё не проверяли"
+    when = datetime.fromtimestamp(last.checked_at, s.tz).strftime("%d.%m %H:%M")
+    return f"🛡 @SpamBot: {last.icon} {last.headline()} <i>({when})</i>"
 
 
 # --------------------------------------------------------------------------- #
@@ -358,13 +371,15 @@ async def settings_view(panel: Panel) -> tuple[str, InlineKeyboardMarkup]:
         f"🎲 Джиттер: <b>±{s.jitter * 100:.0f}%</b> → каждая пауза от "
         f"{humanize(lo)} до {humanize(hi)}\n"
         f"🌍 Часовой пояс: <b>{s.timezone}</b> (сейчас {s.now():%d.%m %H:%M})\n"
-        f"🌙 Ночью: <b>{night_text(panel, s)}</b>\n\n"
+        f"🌙 Ночью: <b>{night_text(panel, s)}</b>\n"
+        f"🛡 Автопроверка @SpamBot: <b>{spam_schedule_text(s)}</b>\n\n"
         "<i>Изменения действуют сразу, в том числе на идущую рассылку. "
         "После дедлайна отправка останавливается.</i>"
     )
     return text, kb(
         [("🏁 Дедлайн", "set:dl"), ("⏱ Интервал", "set:int")],
         [("🎲 Джиттер", "set:jit"), ("🌍 Часовой пояс", "set:tz")],
+        [("🛡 Автопроверка @SpamBot", "set:spam")],
         [(
             "🌙 Переключить: ночью не отправлять" if not s.pause_at_night
             else "🌙 Переключить: ночью слать без звука",
@@ -413,6 +428,30 @@ def timezone_keyboard() -> InlineKeyboardMarkup:
     buttons = [(label, f"set:tz:{zone}") for label, zone in TIMEZONE_PRESETS]
     rows = [buttons[i:i + 3] for i in range(0, len(buttons), 3)]
     return kb(*rows, [("✏️ Другой", "set:tz:custom")], [("◀️ Настройки", "set")])
+
+
+def spam_schedule_text(s: settings_mod.Settings) -> str:
+    if s.spam_every_hours <= 0:
+        return "выключена"
+    notify = (
+        "уведомлять всегда" if s.spam_notify == settings_mod.SPAM_NOTIFY_ALWAYS
+        else "уведомлять только о проблемах"
+    )
+    return f"каждые {s.spam_every_hours} ч, {notify}"
+
+
+def spam_settings_keyboard(s: settings_mod.Settings) -> InlineKeyboardMarkup:
+    def label(h: int) -> str:
+        text = "Выкл" if h == 0 else f"{h} ч"
+        return f"• {text}" if h == s.spam_every_hours else text
+    presets = [(label(h), f"set:spam:{h}") for h in settings_mod.SPAM_EVERY_PRESETS]
+    notify = (
+        "🔔 Сейчас: уведомлять всегда → только о проблемах"
+        if s.spam_notify == settings_mod.SPAM_NOTIFY_ALWAYS
+        else "🔕 Сейчас: только о проблемах → уведомлять всегда"
+    )
+    return kb(presets[:3], presets[3:], [(notify, "set:spamnotify")],
+              [("🛡 Проверить сейчас", "spam")], [("◀️ Настройки", "set")])
 
 
 def night_text(panel: Panel, s: settings_mod.Settings) -> str:
@@ -840,6 +879,30 @@ async def cb_rescan(cq: CallbackQuery, panel: Panel) -> None:
     )
 
 
+@router.callback_query(F.data == "spam")
+async def cb_spam(cq: CallbackQuery, state: FSMContext, panel: Panel) -> None:
+    if panel.spam is None:
+        await cq.answer("Проверка недоступна", show_alert=True)
+        return
+    await cq.answer("Спрашиваю @SpamBot…")
+    await state.clear()
+    await safe_edit(cq.message, "🛡 Спрашиваю @SpamBot… это занимает несколько секунд.")
+    status, previous, stopped = await panel.spam.check()
+    report = await panel.spam.report(status, previous, stopped)
+    if stopped:
+        # A stopped campaign concerns every admin, not just whoever pressed.
+        await panel.spam.broadcast(report)
+    await safe_edit(
+        cq.message,
+        report + (
+            "\n\n<i>@SpamBot показывает только статус аккаунта. Сколько было жалоб, "
+            "Telegram не сообщает.</i>" if status.state == OK else ""
+        ),
+        kb([("🔄 Проверить ещё раз", "spam")], [("⏰ Автопроверка", "set:spam")],
+           [("◀️ Меню", "menu")]),
+    )
+
+
 # --------------------------------------------------------------------------- #
 # handlers: settings
 # --------------------------------------------------------------------------- #
@@ -859,6 +922,50 @@ async def cb_setting(cq: CallbackQuery, state: FSMContext, panel: Panel) -> None
     what = parts[1]
     value = parts[2] if len(parts) > 2 else None
 
+    if what == "spam" and value is None:
+        await cq.answer()
+        s = await load_settings(panel)
+        await safe_edit(
+            cq.message,
+            "🛡 <b>Автопроверка @SpamBot</b>\n\n"
+            f"Сейчас: <b>{spam_schedule_text(s)}</b>\n\n"
+            "Бот сам пишет @SpamBot с вашего аккаунта и присылает результат всем "
+            "админам. Если аккаунт ограничен — идущая рассылка останавливается.\n\n"
+            "Как часто проверять?",
+            spam_settings_keyboard(s),
+        )
+        return
+    if what == "spam":
+        try:
+            hours = int(value)
+        except ValueError:
+            await cq.answer("Неверное значение", show_alert=True)
+            return
+        await save_setting(panel, "spam_every_hours", str(hours), cq.from_user.id)
+        await cq.answer("Выключено" if hours == 0 else f"Каждые {hours} ч")
+        s = await load_settings(panel)
+        await safe_edit(
+            cq.message,
+            f"🛡 <b>Автопроверка @SpamBot</b>\n\nСейчас: <b>{spam_schedule_text(s)}</b>",
+            spam_settings_keyboard(s),
+        )
+        return
+    if what == "spamnotify":
+        s = await load_settings(panel)
+        new = (
+            settings_mod.SPAM_NOTIFY_PROBLEMS
+            if s.spam_notify == settings_mod.SPAM_NOTIFY_ALWAYS
+            else settings_mod.SPAM_NOTIFY_ALWAYS
+        )
+        await save_setting(panel, "spam_notify", new, cq.from_user.id)
+        await cq.answer("Сохранено")
+        s = await load_settings(panel)
+        await safe_edit(
+            cq.message,
+            f"🛡 <b>Автопроверка @SpamBot</b>\n\nСейчас: <b>{spam_schedule_text(s)}</b>",
+            spam_settings_keyboard(s),
+        )
+        return
     if what == "night":
         s = await load_settings(panel)
         new = settings_mod.NIGHT_SILENT if s.pause_at_night else settings_mod.NIGHT_PAUSE

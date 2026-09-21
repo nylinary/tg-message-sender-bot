@@ -360,4 +360,74 @@ async def _login_checks():
 asyncio.run(_login_checks())
 ok("login: bad code retried with the same hash, expiry re-sends, 2FA, token refused")
 
+# --------------------------------------------------------------------------- #
+# @SpamBot
+# --------------------------------------------------------------------------- #
+
+from tgsender import spamcheck as sc  # noqa: E402
+
+replies = {
+    "Good news, no limits are currently applied to your account. You’re free as a bird!":
+        ("ok", None),
+    "Ваш аккаунт свободен от каких-либо ограничений.": ("ok", None),
+    ("I’m afraid some Telegram users found your messages annoying and forwarded them "
+     "to our team of moderators for inspection. The moderators have confirmed the report "
+     "and your account is now limited until 28 Sep 2026, 14:02 UTC.\n\nWhile the account "
+     "is limited, you will not be able to send messages to people who do not have your "
+     "number in their phone contacts."): ("limited", "28 Sep 2026, 14:02 UTC"),
+    ("Unfortunately, some actions can trigger a harsh response from our anti-spam systems. "
+     "If you think your account was limited by mistake, you can submit a complaint."):
+        ("limited", None),
+    ("К сожалению, пользователи пожаловались на ваши сообщения. Ваш аккаунт ограничен "
+     "до 28 сент. 2026, 14:02 UTC."): ("limited", "28 сент. 2026, 14:02 UTC"),
+    "Hello! Choose an option below.": ("unknown", None),
+}
+for text, expected in replies.items():
+    assert sc.classify(text) == expected, (text[:40], sc.classify(text), expected)
+ok("SpamBot replies: ok / limited with date / limited indefinitely / unknown, EN + RU")
+
+st_ = sc.SpamStatus("limited", "28 Sep 2026", "x", 1.0)
+assert sc.SpamStatus.from_json(st_.to_json()) == st_ and sc.SpamStatus.from_json("{") is None
+assert "ОГРАНИЧЕН до 28 Sep 2026" in st_.headline()
+assert st.resolve({}, cfg).spam_every_hours == 6 and st.resolve({}, cfg).spam_notify == "always"
+assert st.resolve({"spam_every_hours": "0", "spam_notify": "problems"}, cfg).spam_every_hours == 0
+assert st.resolve({"spam_every_hours": "x", "spam_notify": "??"}, cfg).spam_notify == "always"
+ok("SpamStatus round-trips; schedule settings default to every 6 h, notify always")
+
+
+class _Msg:
+    def __init__(self, id, out, message):
+        self.id, self.out, self.message = id, out, message
+
+
+class FakeSpamClient:
+    def __init__(self, reply_parts):
+        self.reply_parts = reply_parts
+        self.sent_to = []
+
+    async def send_message(self, peer, text):
+        self.sent_to.append((peer, text))
+        return _Msg(100, True, text)
+
+    async def get_messages(self, peer, limit=5):
+        old = _Msg(99, False, "an older answer")
+        mine = _Msg(100, True, "/start")
+        return [_Msg(101 + i, False, t) for i, t in enumerate(self.reply_parts)] + [mine, old]
+
+
+async def _ask_checks():
+    c = FakeSpamClient(["part one", "part two"])
+    text = await sc.ask_spambot(c, timeout=1, poll=0.01)
+    assert c.sent_to == [("SpamBot", "/start")]
+    assert text == "part one\n\npart two", "only replies newer than our /start, in order"
+    try:
+        await sc.ask_spambot(FakeSpamClient([]), timeout=0.05, poll=0.01)
+    except sc.SpamCheckError:
+        pass
+    else:
+        raise AssertionError("no answer must time out")
+
+asyncio.run(_ask_checks())
+ok("ask_spambot: sends /start, ignores older and own messages, times out cleanly")
+
 print("\nALL OFFLINE TESTS PASSED")

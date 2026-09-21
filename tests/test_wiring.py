@@ -8,6 +8,7 @@ the userbot is a stub that records what it would have sent.
 """
 import asyncio
 import itertools
+import re
 import os
 import sys
 import time
@@ -389,7 +390,8 @@ async def main() -> None:
         row = await db.get_campaign(cid)
         assert row["status"] == "stopped" and "@SpamBot" in row["stop_reason"], dict(row)
         screen = tg.last_screen()
-        assert "ОГРАНИЧЕН до 28 Sep 2026, 14:02 UTC" in screen and "остановлена" in screen
+        assert re.search(r"ОГРАНИЧЕН до \d\d\.09 \d\d:\d\d", screen), screen
+        assert "Временное ограничение" in screen and "остановлена" in screen
         assert broadcasts and "остановлена автоматически" in broadcasts[-1], broadcasts
         await say("/start")
         assert "resume" in tg.last_markup(), "the stopped campaign can be resumed later"

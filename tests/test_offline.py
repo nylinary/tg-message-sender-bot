@@ -381,14 +381,31 @@ replies = {
     ("К сожалению, пользователи пожаловались на ваши сообщения. Ваш аккаунт ограничен "
      "до 28 сент. 2026, 14:02 UTC."): ("limited", "28 сент. 2026, 14:02 UTC"),
     "Hello! Choose an option below.": ("unknown", None),
+    # The reply that went out in production, verbatim.
+    ("Здравствуйте, Александр. К сожалению, кто-то из пользователей Телеграма посчитал Ваши "
+     "сообщения нежелательными и переслал их на проверку команде модераторов. Модераторы "
+     "подтвердили, что жалоба была обоснованной.\n\nВаш аккаунт временно ограничен: Вы не "
+     "можете писать тем, кто не сохранил Ваш номер в список контактов, а также приглашать таких "
+     "пользователей в группы или каналы. Если незнакомый пользователь напишет Вам первым, Вы "
+     "сможете ему ответить.\n\nОграничения будут автоматически сняты 21 Sep 2026, 20:36 UTC "
+     "(по московскому времени — на три часа позже). Обратите внимание, что если пользователи "
+     "будут жаловаться на новые нежелательные сообщения от Вас, в следующий раз аккаунт будет "
+     "ограничен на больший срок."): ("limited", "21 Sep 2026, 20:36 UTC"),
 }
 for text, expected in replies.items():
     assert sc.classify(text) == expected, (text[:40], sc.classify(text), expected)
 ok("SpamBot replies: ok / limited with date / limited indefinitely / unknown, EN + RU")
 
-st_ = sc.SpamStatus("limited", "28 Sep 2026", "x", 1.0)
+ts = sc.until_timestamp("21 Sep 2026, 20:36 UTC")
+assert datetime.fromtimestamp(ts, MSK) == datetime(2026, 9, 21, 23, 36, tzinfo=MSK), "UTC → MSK"
+assert sc.until_timestamp("28 сент. 2026, 14:02 UTC") is not None
+assert sc.until_timestamp(None) is None and sc.until_timestamp("soon") is None
+st_ = sc.SpamStatus("limited", "21 Sep 2026, 20:36 UTC", "x", 1.0, ts)
 assert sc.SpamStatus.from_json(st_.to_json()) == st_ and sc.SpamStatus.from_json("{") is None
-assert "ОГРАНИЧЕН до 28 Sep 2026" in st_.headline()
+assert st_.headline(MSK) == "аккаунт ОГРАНИЧЕН до 21.09 23:36", st_.headline(MSK)
+old = sc.SpamStatus.from_json('{"state":"limited","until":null,"text":"x","checked_at":1}')
+assert old is not None and "срок не указан" in old.headline(), "rows saved before this change load"
+ok("the limit's end date is read from 'будут сняты', shown in local time")
 assert st.resolve({}, cfg).spam_every_hours == 6 and st.resolve({}, cfg).spam_notify == "always"
 assert st.resolve({"spam_every_hours": "0", "spam_notify": "problems"}, cfg).spam_every_hours == 0
 assert st.resolve({"spam_every_hours": "x", "spam_notify": "??"}, cfg).spam_notify == "always"

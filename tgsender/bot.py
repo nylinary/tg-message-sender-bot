@@ -247,7 +247,7 @@ async def spam_line(panel: Panel, s: settings_mod.Settings) -> str:
     if last is None:
         return "🛡 @SpamBot: ещё не проверяли"
     when = datetime.fromtimestamp(last.checked_at, s.tz).strftime("%d.%m %H:%M")
-    return f"🛡 @SpamBot: {last.icon} {last.headline()} <i>({when})</i>"
+    return f"🛡 @SpamBot: {last.icon} {last.headline(s.tz)} <i>(проверка {when})</i>"
 
 
 # --------------------------------------------------------------------------- #

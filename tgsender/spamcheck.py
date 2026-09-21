@@ -16,7 +16,7 @@ import logging
 import re
 import time
 from dataclasses import asdict, dataclass
-from datetime import datetime
+from datetime import datetime, timezone
 
 from . import settings as settings_mod
 
@@ -34,10 +34,36 @@ _LIMITED_MARKERS = (
     "limited", "limit", "harsh response", "annoying", "ограничен", "ограничение",
     "жалоб", "суров", "не сможете",
 )
+# "limited until 28 Sep 2026, 14:02 UTC", "ограничен до …", and the phrasing
+# @SpamBot actually uses in Russian: "Ограничения будут автоматически сняты …".
 _UNTIL = re.compile(
-    r"(?:until|до)\s+(\d{1,2}\s+[^\s,.]+\.?\s+\d{4}(?:,?\s*(?:в\s*)?\d{1,2}:\d{2}(?:\s*UTC)?)?)",
+    r"(?:until|до|сняты|снято|released on|removed on|lifted on|lifted)\s+"
+    r"(\d{1,2}\s+[^\s,.]+\.?\s+\d{4}(?:,?\s*(?:в\s*)?\d{1,2}:\d{2}(?:\s*UTC)?)?)",
     re.IGNORECASE,
 )
+_MONTHS = {m: i for i, m in enumerate(
+    ("jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "oct", "nov", "dec"), 1)}
+_MONTHS.update({m: i for i, m in enumerate(
+    ("янв", "фев", "мар", "апр", "мая", "июн", "июл", "авг", "сен", "окт", "ноя", "дек"), 1)})
+_PARTS = re.compile(r"(\d{1,2})\s+([^\s,.]+)\.?\s+(\d{4})(?:,?\s*(?:в\s*)?(\d{1,2}):(\d{2}))?")
+
+
+def until_timestamp(until: str | None) -> float | None:
+    """'21 Sep 2026, 20:36 UTC' -> epoch seconds. @SpamBot quotes UTC."""
+    if not until:
+        return None
+    m = _PARTS.search(until)
+    if not m:
+        return None
+    month = _MONTHS.get(m.group(2).lower()[:3])
+    if not month:
+        return None
+    try:
+        moment = datetime(int(m.group(3)), month, int(m.group(1)),
+                          int(m.group(4) or 0), int(m.group(5) or 0), tzinfo=timezone.utc)
+    except ValueError:
+        return None
+    return moment.timestamp()
 
 
 class SpamCheckError(Exception):
@@ -50,17 +76,22 @@ class SpamStatus:
     until: str | None
     text: str
     checked_at: float
+    until_ts: float | None = None
 
     @property
     def icon(self) -> str:
         return {OK: "✅", LIMITED: "🚨", UNKNOWN: "❓", ERROR: "⚠️"}[self.state]
 
-    def headline(self) -> str:
+    def headline(self, tz=None) -> str:
         if self.state == OK:
             return "ограничений нет"
         if self.state == LIMITED:
-            return f"аккаунт ОГРАНИЧЕН до {self.until}" if self.until else \
-                "аккаунт ОГРАНИЧЕН (без срока)"
+            if self.until_ts is not None:
+                local = datetime.fromtimestamp(self.until_ts, tz or timezone.utc)
+                return f"аккаунт ОГРАНИЧЕН до {local:%d.%m %H:%M}"
+            if self.until:
+                return f"аккаунт ОГРАНИЧЕН до {self.until}"
+            return "аккаунт ОГРАНИЧЕН (срок не указан)"
         if self.state == UNKNOWN:
             return "ответ не удалось разобрать"
         return "проверка не удалась"
@@ -136,7 +167,7 @@ class SpamWatch:
                 state, until = classify(text)
             except Exception as exc:  # noqa: BLE001 - a failed check must be reported, not crash
                 text, state, until = f"{type(exc).__name__}: {exc}", ERROR, None
-            status = SpamStatus(state, until, text[:1500], time.time())
+            status = SpamStatus(state, until, text[:1500], time.time(), until_timestamp(until))
             await self.db.set_setting(STORE_KEY, status.to_json())
             log.info("SpamBot check: %s %s", state, until or "")
 
@@ -154,7 +185,17 @@ class SpamWatch:
                      stopped: bool) -> str:
         s = await settings_mod.load(self.db, self.cfg)
         when = datetime.fromtimestamp(status.checked_at, s.tz).strftime("%d.%m %H:%M")
-        lines = [f"🛡 <b>@SpamBot: {status.headline()}</b> {status.icon}", f"<i>Проверка {when}</i>"]
+        lines = [
+            f"🛡 <b>@SpamBot: {status.headline(s.tz)}</b> {status.icon}",
+            f"<i>Проверка {when}, время — {s.timezone}</i>",
+        ]
+        if status.state == LIMITED and status.until_ts is not None:
+            left = status.until_ts - time.time()
+            lines.append(
+                f"Временное ограничение, снимется через ~{_hours(left)}."
+                if left > 0 else
+                "Срок ограничения уже истёк — нажми «Проверить» ещё раз через пару минут."
+            )
         if previous and previous.state == LIMITED and status.state == OK:
             lines.append("\n🎉 Ограничения сняты.")
         if stopped:
@@ -207,6 +248,11 @@ class SpamWatch:
                 log.exception("SpamBot watcher failed; retrying in 5 minutes")
                 wait = 300
             await asyncio.sleep(wait)
+
+
+def _hours(seconds: float) -> str:
+    minutes = int(seconds // 60)
+    return f"{minutes // 60} ч {minutes % 60} мин" if minutes >= 60 else f"{minutes} мин"
 
 
 def _escape(text: str) -> str:

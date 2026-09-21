@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import re
 import tomllib
 from dataclasses import dataclass
 from datetime import datetime
@@ -37,6 +38,7 @@ class Config:
     api_hash: str
     bot_token: str
     admin_ids: frozenset[int]
+    admin_usernames: frozenset[str]
     account: str
     deadline: datetime
     age_options: tuple[int, ...]
@@ -52,7 +54,7 @@ HINTS = {
     "TG_API_ID": "from https://my.telegram.org -> API development tools",
     "TG_API_HASH": "from https://my.telegram.org -> API development tools",
     "BOT_TOKEN": "from @BotFather",
-    "ADMIN_IDS": "your numeric Telegram id (ask @userinfobot), comma separated",
+    "ADMIN_IDS": "numeric ids (ask @userinfobot) and/or @usernames, comma separated",
 }
 
 
@@ -71,15 +73,42 @@ def _require(name: str) -> str:
     return value
 
 
-def _admin_ids() -> frozenset[int]:
-    raw = _require("ADMIN_IDS")
-    try:
-        ids = {int(part) for part in raw.replace(" ", "").split(",") if part}
-    except ValueError as exc:
-        raise SystemExit(f"ADMIN_IDS must be comma-separated numbers: {exc}") from exc
-    if not ids:
+# Telegram usernames: 5-32 chars, must start with a letter, letters/digits/_ only.
+USERNAME_RE = re.compile(r"[a-z][a-z0-9_]{3,31}")
+
+
+def parse_admins(raw: str) -> tuple[frozenset[int], frozenset[str]]:
+    """Split ADMIN_IDS into numeric ids and @usernames.
+
+    Both forms are accepted, mixed freely:
+        ADMIN_IDS=111111111, @nylinary, someone_else
+
+    Usernames are a convenience: they are resolved to numeric ids at startup,
+    because a username can be released and re-registered by somebody else,
+    while an id is permanent.
+    """
+    ids: set[int] = set()
+    usernames: set[str] = set()
+
+    for part in raw.split(","):
+        token = part.strip()
+        if not token:
+            continue
+        if token.lstrip("-").isdigit():
+            ids.add(int(token))
+            continue
+        name = token.lstrip("@").lower()
+        if not USERNAME_RE.fullmatch(name):
+            raise SystemExit(
+                f"ADMIN_IDS: {token!r} is neither a numeric id nor a valid "
+                f"Telegram username (5-32 chars, starts with a letter, "
+                f"letters/digits/underscore only)."
+            )
+        usernames.add(name)
+
+    if not ids and not usernames:
         raise SystemExit("ADMIN_IDS is empty — nobody would be able to use the panel.")
-    return frozenset(ids)
+    return frozenset(ids), frozenset(usernames)
 
 
 def require_database_url(cfg: "Config") -> str:
@@ -109,6 +138,7 @@ def load(config_path: Path | None = None) -> Config:
     with open(path, "rb") as fh:
         raw = tomllib.load(fh)
 
+    admin_ids, admin_usernames = parse_admins(_require("ADMIN_IDS"))
     account = os.environ.get("TG_ACCOUNT", "main").strip() or "main"
     state_dir = ROOT / raw["files"]["state_dir"] / account
     state_dir.mkdir(parents=True, exist_ok=True)
@@ -122,7 +152,8 @@ def load(config_path: Path | None = None) -> Config:
         api_id=int(_require("TG_API_ID")),
         api_hash=_require("TG_API_HASH"),
         bot_token=_require("BOT_TOKEN"),
-        admin_ids=_admin_ids(),
+        admin_ids=admin_ids,
+        admin_usernames=admin_usernames,
         account=account,
         deadline=datetime.fromisoformat(raw["campaign"]["deadline"]),
         age_options=tuple(raw["campaign"]["age_options"]),

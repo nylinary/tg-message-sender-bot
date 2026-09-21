@@ -1,12 +1,13 @@
 from __future__ import annotations
 
 import time
+from collections.abc import Iterable
 from dataclasses import dataclass, field
 from datetime import datetime
 
 from aiogram import F, Router
 from aiogram.exceptions import TelegramBadRequest
-from aiogram.filters import Command
+from aiogram.filters import BaseFilter, Command
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
@@ -20,6 +21,43 @@ from .scheduling import BADGE, IMPOSSIBLE, build_plan, describe, humanize
 from .sender import SendWorker
 
 router = Router()
+
+
+class AdminGate(BaseFilter):
+    """Allows the panel through for a set of numeric ids and/or @usernames.
+
+    Ids are authoritative. Usernames are a convenience that the startup
+    resolver turns into ids; whatever is left unresolved is still matched by
+    name, and the id is pinned the first time that person appears, so the weak
+    check happens at most once per admin per process.
+    """
+
+    def __init__(self, ids: Iterable[int], usernames: Iterable[str]):
+        self.ids: set[int] = set(ids)
+        self.usernames: set[str] = {u.lstrip("@").lower() for u in usernames}
+        self.unresolved: set[str] = set(self.usernames)
+
+    async def __call__(self, event: Message | CallbackQuery) -> bool:
+        user = event.from_user
+        if user is None:
+            return False
+        if user.id in self.ids:
+            return True
+        name = (user.username or "").lower()
+        if name and name in self.usernames:
+            self.ids.add(user.id)
+            self.unresolved.discard(name)
+            return True
+        return False
+
+    def note_resolved(self, username: str, user_id: int) -> None:
+        self.ids.add(user_id)
+        self.unresolved.discard(username.lstrip("@").lower())
+
+    def describe(self) -> str:
+        parts = [str(i) for i in sorted(self.ids)]
+        parts += [f"@{u} (unresolved)" for u in sorted(self.unresolved)]
+        return ", ".join(parts)
 
 
 @dataclass

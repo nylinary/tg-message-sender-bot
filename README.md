@@ -81,12 +81,36 @@ Variables the `bot` service needs:
 | `TG_API_ID`, `TG_API_HASH` | from my.telegram.org |
 | `TG_SESSION` | output of `python -m tgsender session` |
 | `BOT_TOKEN` | from @BotFather |
-| `ADMIN_IDS` | your numeric ID + friends', comma separated (@userinfobot) |
+| `ADMIN_IDS` | numeric ids and/or `@usernames`, comma separated — see below |
 | `DATABASE_URL` | `${{Postgres.DATABASE_URL}}` |
 | `TG_ACCOUNT` | `main` |
 
 Deploys happen on push to `main`. There is no HTTP port — this is a worker, so
 Railway showing no domain is correct.
+
+## Who can use the panel
+
+`ADMIN_IDS` takes numeric ids, `@usernames`, or both, mixed:
+
+```
+ADMIN_IDS=111111111, @nylinary, some_friend
+```
+
+The `@` is optional and case is ignored. Get numeric ids from
+[@userinfobot](https://t.me/userinfobot).
+
+At startup the bot resolves every username to a numeric id through the sending
+account and logs the mapping, so the running filter compares ids, not names.
+If a handle cannot be resolved — the person is not reachable from that account,
+or Telegram is being difficult — the bot logs a warning and falls back to
+matching that one by name, pinning their id the first time they press a button.
+
+**Prefer numeric ids where you have them.** A username can be released and
+re-registered by anyone, and this panel sends from *your* personal account. An
+id is permanent. Usernames are here for convenience, not as the security
+boundary.
+
+Anyone not on the list is ignored silently — no reply, no hint the bot exists.
 
 ## Running locally
 

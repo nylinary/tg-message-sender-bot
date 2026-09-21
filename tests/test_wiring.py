@@ -23,10 +23,12 @@ os.environ.setdefault("BOT_TOKEN", "123:ABC")
 os.environ.setdefault("ADMIN_IDS", "111, 222")
 os.environ["TG_ACCOUNT"] = "wiring"
 
-from aiogram import Dispatcher, F  # noqa: E402
+from aiogram import Dispatcher  # noqa: E402
 
 from tgsender import config as config_mod  # noqa: E402
-from tgsender.bot import Panel, age_keyboard, kb, main_menu, router, status_text  # noqa: E402
+from tgsender.bot import (  # noqa: E402
+    AdminGate, Panel, age_keyboard, kb, main_menu, router, status_text,
+)
 from tgsender.db import DB, Recipient  # noqa: E402
 from tgsender.sender import SendWorker  # noqa: E402
 
@@ -48,9 +50,9 @@ async def main() -> None:
         panel = Panel(cfg=cfg, db=db, client=None, worker=worker)
 
         # Dispatcher registration is where aiogram validates handlers/filters.
-        allowed = set(cfg.admin_ids)
-        router.message.filter(F.from_user.id.in_(allowed))
-        router.callback_query.filter(F.from_user.id.in_(allowed))
+        gate = AdminGate(cfg.admin_ids, cfg.admin_usernames)
+        router.message.filter(gate)
+        router.callback_query.filter(gate)
         dp = Dispatcher()
         dp.include_router(router)
         n = len(router.message.handlers) + len(router.callback_query.handlers)

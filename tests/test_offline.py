@@ -2,6 +2,7 @@
 
     .venv/bin/python tests/test_offline.py
 """
+import asyncio
 import os
 import sys
 from datetime import datetime, timedelta
@@ -27,6 +28,7 @@ cfg = config_mod.load()
 # --------------------------------------------------------------------------- #
 
 assert cfg.admin_ids == frozenset({111, 222}), "ADMIN_IDS must tolerate spaces"
+assert cfg.admin_usernames == frozenset()
 assert config_mod.normalize_dsn("postgres://a:b@h/d") == "postgresql://a:b@h/d"
 assert config_mod.normalize_dsn("postgresql+asyncpg://a@h/d") == "postgresql://a@h/d"
 assert config_mod.normalize_dsn("postgresql://a@h/d") == "postgresql://a@h/d"
@@ -40,6 +42,71 @@ except SystemExit as exc:
 else:
     raise AssertionError("a missing DATABASE_URL must fail loudly, not silently")
 ok("a missing DATABASE_URL is rejected with an actionable message")
+
+# --------------------------------------------------------------------------- #
+# ADMIN_IDS: numeric ids and @usernames, mixed
+# --------------------------------------------------------------------------- #
+
+parse = config_mod.parse_admins
+assert parse("111,222") == (frozenset({111, 222}), frozenset())
+assert parse("@nylinary") == (frozenset(), frozenset({"nylinary"}))
+assert parse(" 111 , @Nylinary , some_friend ") == (
+    frozenset({111}), frozenset({"nylinary", "some_friend"})
+), "mixed forms, @ optional, case-insensitive, whitespace tolerated"
+assert parse("@aaaa,@AAAA")[1] == frozenset({"aaaa"}), "same handle twice collapses"
+ok("ADMIN_IDS accepts ids and usernames mixed, with or without @")
+
+for bad in ("@abc", "1nvalid", "has-a-dash", "way" + "x" * 40, "@@x"):
+    try:
+        parse(bad)
+    except SystemExit as exc:
+        assert "ADMIN_IDS" in str(exc)
+    else:
+        raise AssertionError(f"{bad!r} should have been rejected")
+for empty in ("", "   ", " , , "):
+    try:
+        parse(empty)
+    except SystemExit:
+        pass
+    else:
+        raise AssertionError("an empty ADMIN_IDS must not lock everyone out silently")
+ok("malformed handles and an empty list are rejected, not silently dropped")
+
+
+class _U:
+    def __init__(self, uid, username=None):
+        self.id, self.username = uid, username
+
+
+class _Ev:
+    def __init__(self, user):
+        self.from_user = user
+
+
+async def _gate_checks():
+    gate = bot_mod.AdminGate({111}, {"nylinary"})
+    assert gate.unresolved == {"nylinary"}
+
+    assert await gate(_Ev(_U(111))) is True, "known id passes"
+    assert await gate(_Ev(_U(999, "stranger"))) is False, "stranger is refused"
+    assert await gate(_Ev(_U(999))) is False, "no username, unknown id -> refused"
+    assert await gate(_Ev(None)) is False, "an event with no sender is refused"
+
+    # First appearance by username pins the numeric id.
+    assert await gate(_Ev(_U(777, "NyLinary"))) is True, "username match is case-folded"
+    assert 777 in gate.ids and not gate.unresolved
+    assert await gate(_Ev(_U(777))) is True, "afterwards the id alone is enough"
+
+    # Startup resolution does the same without anyone messaging first.
+    g2 = bot_mod.AdminGate({}, {"friend"})
+    g2.note_resolved("@Friend", 555)
+    assert 555 in g2.ids and not g2.unresolved
+    assert await g2(_Ev(_U(555))) is True
+    assert "555" in g2.describe() and "unresolved" not in g2.describe()
+    assert "unresolved" in bot_mod.AdminGate({}, {"nope"}).describe()
+
+asyncio.run(_gate_checks())
+ok("AdminGate: ids pass, usernames pin their id on first use, strangers refused")
 
 # --------------------------------------------------------------------------- #
 # quiet hours

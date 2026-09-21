@@ -5,14 +5,14 @@ import asyncio
 import logging
 import sys
 
-from aiogram import Bot, Dispatcher, F
+from aiogram import Bot, Dispatcher
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
 from telethon import TelegramClient
 from telethon.sessions import StringSession
 
 from . import config as config_mod
-from .bot import Panel, router
+from .bot import AdminGate, Panel, router
 from .db import DB
 from .sender import SendWorker
 
@@ -54,6 +54,33 @@ async def _connect_userbot(cfg: config_mod.Config) -> TelegramClient:
     return client
 
 
+async def _resolve_admin_usernames(client: TelegramClient, gate: AdminGate) -> None:
+    """Turn @usernames into permanent numeric ids using the sending account.
+
+    A username can be released and claimed by somebody else; an id cannot.
+    Resolving once at startup means the rest of the run compares ids.
+    """
+    from telethon.tl.types import User
+
+    for name in sorted(gate.usernames):
+        try:
+            entity = await client.get_entity(name)
+        except Exception as exc:  # noqa: BLE001 - one bad handle must not block boot
+            log.warning(
+                "Admin @%s could not be resolved (%s). Falling back to matching "
+                "by username, which is weaker — put their numeric id in "
+                "ADMIN_IDS instead.",
+                name,
+                type(exc).__name__,
+            )
+            continue
+        if not isinstance(entity, User):
+            log.warning("Admin @%s is not a user account; ignoring.", name)
+            continue
+        gate.note_resolved(name, entity.id)
+        log.info("Admin @%s -> id %s", name, entity.id)
+
+
 async def cmd_session(cfg: config_mod.Config) -> int:
     """Log in interactively and print a session string to paste into TG_SESSION."""
     client = TelegramClient(StringSession(), cfg.api_id, cfg.api_hash)
@@ -86,7 +113,9 @@ async def cmd_run(cfg: config_mod.Config) -> int:
     )
     me = await bot.get_me()
     log.info("Control bot ready: @%s", me.username)
-    log.info("Admins: %s", ", ".join(str(i) for i in sorted(cfg.admin_ids)))
+    gate = AdminGate(cfg.admin_ids, cfg.admin_usernames)
+    await _resolve_admin_usernames(client, gate)
+    log.info("Admins: %s", gate.describe())
 
     async def notify(event: str, **kw) -> None:
         """Push campaign lifecycle events to everyone with panel access."""
@@ -102,7 +131,7 @@ async def cmd_run(cfg: config_mod.Config) -> int:
             )
         else:
             return
-        for admin_id in cfg.admin_ids:
+        for admin_id in sorted(gate.ids):
             try:
                 await bot.send_message(admin_id, text)
             except Exception as exc:  # noqa: BLE001 - a dead admin chat is not fatal
@@ -128,7 +157,7 @@ async def cmd_run(cfg: config_mod.Config) -> int:
             stale["id"],
             freed,
         )
-        for admin_id in cfg.admin_ids:
+        for admin_id in sorted(gate.ids):
             try:
                 await bot.send_message(
                     admin_id,
@@ -140,9 +169,8 @@ async def cmd_run(cfg: config_mod.Config) -> int:
                 pass
 
     # Only the whitelist may touch the panel. Everyone else is ignored silently.
-    allowed = set(cfg.admin_ids)
-    router.message.filter(F.from_user.id.in_(allowed))
-    router.callback_query.filter(F.from_user.id.in_(allowed))
+    router.message.filter(gate)
+    router.callback_query.filter(gate)
 
     dp = Dispatcher()
     dp.include_router(router)

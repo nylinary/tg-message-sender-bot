@@ -507,3 +507,35 @@ async def cb_rescan(cq: CallbackQuery, panel: Panel) -> None:
         f"Пропущено (боты, каналы, группы): {c.get('skipped', 0)}",
         await main_menu(panel),
     )
+
+
+# --------------------------------------------------------------------------- #
+# fallbacks — registered last, so they only catch what nothing else claimed
+# --------------------------------------------------------------------------- #
+
+
+@router.callback_query()
+async def cb_stale(cq: CallbackQuery, state: FSMContext, panel: Panel) -> None:
+    """A button from a message older than the current process.
+
+    FSM state lives in memory, so a redeploy loses it and the step-specific
+    handlers stop matching. Without this the button just spins forever.
+    """
+    await state.clear()
+    await cq.answer("Эта кнопка устарела — бот перезапускался", show_alert=True)
+    await safe_edit(
+        cq.message,
+        "♻️ Бот перезапускался, и эта кнопка больше не активна.\n\n"
+        "Прогресс рассылок не потерян — он в базе. Начни заново из меню.",
+        await main_menu(panel),
+    )
+
+
+@router.message()
+async def msg_fallback(message: Message, state: FSMContext, panel: Panel) -> None:
+    """Anything an admin sends that no step expected."""
+    await state.clear()
+    await message.answer(
+        "Не понял. Чтобы отправить приглашения, начни с «Новая рассылка».",
+        reply_markup=await main_menu(panel),
+    )

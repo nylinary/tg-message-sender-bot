@@ -15,6 +15,7 @@ from . import config as config_mod
 from . import settings as settings_mod
 from .bot import AdminGate, Panel, router
 from .db import DB
+from .login import LoginError, interactive_login
 from .sender import SendWorker
 
 logging.basicConfig(
@@ -99,9 +100,12 @@ async def cmd_session(cfg: config_mod.Config) -> int:
     print("=" * 72 + "\n")
 
     client = TelegramClient(StringSession(), cfg.api_id, cfg.api_hash)
-    await client.start(
-        phone=lambda: input("Phone number of your personal account (+79991234567): ")
-    )
+    try:
+        await interactive_login(client)
+    except LoginError as exc:
+        await client.disconnect()
+        print(f"\n❌ {exc}")
+        return 1
     me = await client.get_me()
     string = client.session.save()
     await client.disconnect()

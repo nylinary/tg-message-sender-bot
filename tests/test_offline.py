@@ -269,4 +269,95 @@ assert errors.FloodWaitError not in sender_mod.PERMANENT_ERRORS
 assert not set(sender_mod.ACCOUNT_ERRORS) & set(sender_mod.PERMANENT_ERRORS)
 ok("error classes are disjoint and correctly assigned")
 
+# --------------------------------------------------------------------------- #
+# login
+# --------------------------------------------------------------------------- #
+
+from telethon.tl.types import auth as tl_auth  # noqa: E402
+
+from tgsender import login  # noqa: E402
+
+n = login.normalize_phone
+assert n("89921873379") == "+79921873379", "domestic 8… becomes +7…"
+assert n("8 (992) 187-33-79") == "+79921873379"
+assert n("79921873379") == n("+7 992 187 33 79") == n("9921873379") == "+79921873379"
+assert n("+77011234567") == "+77011234567" and n("+380501234567") == "+380501234567"
+for bad in ("123", "8646649663:AAFA-viykbPjBM", "abc"):
+    raises(login.LoginError, n, bad)
+ok("phone: 8…, spaces, brackets, bare mobile → +7…; bot tokens and junk refused")
+
+
+class FakeLoginClient:
+    """Scripted Telegram: each sign_in pops the next outcome."""
+
+    def __init__(self, outcomes):
+        self.outcomes = list(outcomes)
+        self.hashes_sent, self.sign_ins = [], []
+
+    async def connect(self):
+        pass
+
+    async def send_code_request(self, phone):
+        h = f"hash{len(self.hashes_sent)}"
+        self.hashes_sent.append(h)
+        return tl_auth.SentCode(type=tl_auth.SentCodeTypeApp(length=5), phone_code_hash=h)
+
+    async def sign_in(self, phone=None, code=None, *, password=None, phone_code_hash=None):
+        self.sign_ins.append((phone, code, password, phone_code_hash))
+        outcome = self.outcomes.pop(0)
+        if isinstance(outcome, type) and issubclass(outcome, Exception):
+            raise outcome(request=None)
+        return outcome
+
+
+def scripted(answers):
+    it = iter(answers)
+    return lambda prompt="": next(it)
+
+
+async def _login_checks():
+    # The user's exact failure: 8… number, one bad code, then the right one.
+    c = FakeLoginClient([errors.PhoneCodeInvalidError, "ME"])
+    me = await login.interactive_login(
+        c, ask=scripted(["89921873379", "41653", "4 1 6 5 4"]), ask_secret=scripted([])
+    )
+    assert me == "ME"
+    assert all(p == "+79921873379" for p, *_ in c.sign_ins), c.sign_ins
+    assert all(h == "hash0" for *_, h in c.sign_ins), "the hash is passed on every try"
+    assert c.sign_ins[-1][1] == "41654", "spaces in the code are ignored"
+
+    # Expired code → a new one is requested and its hash is used.
+    c = FakeLoginClient([errors.PhoneCodeExpiredError, "ME"])
+    await login.interactive_login(c, ask=scripted(["+79921873379", "11111", "22222"]),
+                                  ask_secret=scripted([]))
+    assert c.hashes_sent == ["hash0", "hash1"] and c.sign_ins[-1][3] == "hash1"
+
+    # Two-step verification, one wrong password first.
+    c = FakeLoginClient([errors.SessionPasswordNeededError,
+                         errors.PasswordHashInvalidError, "ME"])
+    me = await login.interactive_login(c, ask=scripted(["+79921873379", "12345"]),
+                                       ask_secret=scripted(["wrong", "right"]))
+    assert me == "ME" and c.sign_ins[-1][2] == "right"
+
+    # A pasted bot token is refused at the phone prompt, then a number works.
+    c = FakeLoginClient(["ME"])
+    await login.interactive_login(
+        c, ask=scripted(["8646649663:AAFA-viykbPjBM", "89921873379", "12345"]),
+        ask_secret=scripted([]),
+    )
+    assert c.sign_ins[0][0] == "+79921873379"
+
+    # Three wrong codes end cleanly with advice, not a traceback.
+    c = FakeLoginClient([errors.PhoneCodeInvalidError] * 3)
+    try:
+        await login.interactive_login(c, ask=scripted(["+79921873379", "1", "2", "3"]),
+                                      ask_secret=scripted([]))
+    except login.LoginError as exc:
+        assert "заново" in str(exc)
+    else:
+        raise AssertionError("three bad codes must stop")
+
+asyncio.run(_login_checks())
+ok("login: bad code retried with the same hash, expiry re-sends, 2FA, token refused")
+
 print("\nALL OFFLINE TESTS PASSED")

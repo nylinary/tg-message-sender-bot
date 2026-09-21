@@ -93,31 +93,21 @@ class SendWorker:
 
     async def _run(self, campaign_id: int) -> None:
         p = self.cfg.pacing
-        campaign = self.db.get_campaign(campaign_id)
-        text = campaign["text"]
+        campaign = await self.db.get_campaign(campaign_id)
+        text = campaign["body"]
         parse_mode = campaign["parse_mode"]
         delay = campaign["delay"]
         sent_in_run = 0
+        recipient = None
 
         try:
             while True:
                 if self._stop.is_set():
                     return await self._finish(campaign_id, "stopped", "Остановлено вручную")
 
-                recipient = self.db.next_pending(campaign_id)
-                if recipient is None:
-                    return await self._finish(campaign_id, "done", "")
-
-                # Re-derive the pace from what is actually left, so FLOOD_WAITs
-                # and manual pauses get absorbed instead of silently blowing
-                # through the deadline.
-                if sent_in_run and sent_in_run % REPLAN_EVERY == 0:
-                    remaining = self.db.progress(campaign_id).get("pending", 0)
-                    delay = build_plan(
-                        remaining, self.cfg.deadline, p, self.cfg.risk
-                    ).delay
-                    self.db.set_campaign_delay(campaign_id, delay)
-
+                # Pace first, claim second: a claimed recipient is marked
+                # in-flight, and holding one across a long sleep would strand
+                # them if the process died mid-wait.
                 if not await self._wait_out_quiet_hours():
                     return await self._finish(campaign_id, "stopped", "Остановлено вручную")
 
@@ -132,17 +122,36 @@ class SendWorker:
                     if not await self._sleep(gap, "интервал"):
                         return await self._finish(campaign_id, "stopped", "Остановлено вручную")
 
+                recipient = await self.db.claim_next(campaign_id)
+                if recipient is None:
+                    return await self._finish(campaign_id, "done", "")
+
                 outcome = await self._send_one(campaign_id, recipient, text, parse_mode)
+                recipient = None
                 if outcome == "hard_stop":
                     return
                 if outcome == "sent":
                     sent_in_run += 1
                     self.multiplier = max(1.0, self.multiplier * 0.97)
 
+                # Re-derive the pace from what is actually left, so FLOOD_WAITs
+                # and manual pauses get absorbed instead of silently blowing
+                # through the deadline.
+                if sent_in_run and sent_in_run % REPLAN_EVERY == 0:
+                    remaining = (await self.db.progress(campaign_id)).get("pending", 0)
+                    delay = build_plan(
+                        remaining, self.cfg.deadline, p, self.cfg.risk
+                    ).delay
+                    await self.db.set_campaign_delay(campaign_id, delay)
+
         except asyncio.CancelledError:
-            self.db.finish_campaign(campaign_id, "stopped", "Процесс остановлен")
+            if recipient is not None:
+                await self.db.mark(campaign_id, recipient.user_id, "pending")
+            await self.db.finish_campaign(campaign_id, "stopped", "Процесс остановлен")
             raise
         except Exception as exc:  # noqa: BLE001 - worker must not die silently
+            if recipient is not None:
+                await self.db.mark(campaign_id, recipient.user_id, "pending")
             await self._finish(campaign_id, "failed", f"{type(exc).__name__}: {exc}")
 
     async def _send_one(self, campaign_id, recipient, text, parse_mode) -> str:
@@ -156,6 +165,8 @@ class SendWorker:
                 peer, text, parse_mode=parse_mode, link_preview=True
             )
         except errors.FloodWaitError as exc:
+            # Not this recipient's fault — put them back in the queue.
+            await self.db.mark(campaign_id, recipient.user_id, "pending")
             self.multiplier = min(
                 self.cfg.pacing.flood_backoff_max,
                 self.multiplier * self.cfg.pacing.flood_backoff,
@@ -177,6 +188,7 @@ class SendWorker:
                 return "hard_stop"
             return "retry"
         except ACCOUNT_ERRORS as exc:
+            await self.db.mark(campaign_id, recipient.user_id, "pending")
             await self._finish(
                 campaign_id,
                 "stopped",
@@ -185,15 +197,17 @@ class SendWorker:
             )
             return "hard_stop"
         except PERMANENT_ERRORS as exc:
-            self.db.mark(campaign_id, recipient.user_id, "skipped", type(exc).__name__)
+            await self.db.mark(
+                campaign_id, recipient.user_id, "skipped", type(exc).__name__
+            )
             return "skipped"
         except Exception as exc:  # noqa: BLE001 - one bad peer must not kill the run
-            self.db.mark(
+            await self.db.mark(
                 campaign_id, recipient.user_id, "failed", f"{type(exc).__name__}: {exc}"
             )
             return "failed"
 
-        self.db.mark(campaign_id, recipient.user_id, "sent")
+        await self.db.mark(campaign_id, recipient.user_id, "sent")
         return "sent"
 
     async def _wait_out_quiet_hours(self) -> bool:
@@ -210,19 +224,22 @@ class SendWorker:
                 return False
 
     async def _finish(self, campaign_id: int, status: str, reason: str) -> None:
-        self.db.finish_campaign(campaign_id, status, reason)
-        await self.on_event("finished", status=status, reason=reason, campaign_id=campaign_id)
+        await self.db.release_inflight(campaign_id)
+        await self.db.finish_campaign(campaign_id, status, reason)
+        await self.on_event(
+            "finished", status=status, reason=reason, campaign_id=campaign_id
+        )
 
     # ------------------------------------------------------------------ #
     # status
     # ------------------------------------------------------------------ #
 
-    def snapshot(self) -> dict:
+    async def snapshot(self) -> dict:
         if self.campaign_id is None:
             return {"running": False}
-        counts = self.db.progress(self.campaign_id)
-        campaign = self.db.get_campaign(self.campaign_id)
-        last_hour = self.db.sent_since(self.campaign_id, time.time() - 3600)
+        counts = await self.db.progress(self.campaign_id)
+        campaign = await self.db.get_campaign(self.campaign_id)
+        last_hour = await self.db.sent_since(self.campaign_id, time.time() - 3600)
         return {
             "running": self.running,
             "campaign_id": self.campaign_id,

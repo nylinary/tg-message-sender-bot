@@ -9,6 +9,7 @@ from aiogram import Bot, Dispatcher, F
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
 from telethon import TelegramClient
+from telethon.sessions import StringSession
 
 from . import config as config_mod
 from .bot import Panel, router
@@ -23,39 +24,61 @@ logging.basicConfig(
 log = logging.getLogger("tgsender")
 
 
-async def _connect_userbot(cfg: config_mod.Config, interactive: bool) -> TelegramClient:
-    client = TelegramClient(str(cfg.session_path), cfg.api_id, cfg.api_hash)
-    if interactive:
-        await client.start()
-    else:
-        await client.connect()
-        if not await client.is_user_authorized():
-            await client.disconnect()
-            raise SystemExit(
-                "The userbot account is not authorised yet.\n"
-                "Run:  python -m tgsender login"
-            )
+def _make_client(cfg: config_mod.Config) -> TelegramClient:
+    """Session string if we have one, file on disk otherwise.
+
+    Deployed containers have no persistent disk, so TG_SESSION is the only
+    thing that survives a redeploy. Locally the file is more convenient.
+    """
+    session = (
+        StringSession(cfg.session_string)
+        if cfg.session_string
+        else str(cfg.session_path)
+    )
+    return TelegramClient(session, cfg.api_id, cfg.api_hash)
+
+
+async def _connect_userbot(cfg: config_mod.Config) -> TelegramClient:
+    client = _make_client(cfg)
+    await client.connect()
+    if not await client.is_user_authorized():
+        await client.disconnect()
+        raise SystemExit(
+            "The sending account is not authorised.\n"
+            "Run `python -m tgsender session` locally, then set TG_SESSION."
+        )
     me = await client.get_me()
     log.info(
-        "Userbot ready: %s (@%s, id %s)",
-        me.first_name or "?",
-        me.username or "-",
-        me.id,
+        "Userbot ready: %s (@%s, id %s)", me.first_name or "?", me.username or "-", me.id
     )
     return client
 
 
-async def cmd_login(cfg: config_mod.Config) -> int:
-    client = await _connect_userbot(cfg, interactive=True)
+async def cmd_session(cfg: config_mod.Config) -> int:
+    """Log in interactively and print a session string to paste into TG_SESSION."""
+    client = TelegramClient(StringSession(), cfg.api_id, cfg.api_hash)
+    await client.start()
+    me = await client.get_me()
+    string = client.session.save()
     await client.disconnect()
-    print(f"\nSession saved to {cfg.session_path}")
-    print("Now run:  python -m tgsender run")
+
+    print("\n" + "=" * 72)
+    print(f"Authorised as {me.first_name or ''} (@{me.username or '-'}, id {me.id})")
+    print("=" * 72)
+    print("\nSet this as TG_SESSION (Railway variable, or your local .env):\n")
+    print(string)
+    print(
+        "\nTreat it exactly like a password — it IS full access to the account.\n"
+        "Anyone holding it can read and send your messages. Never commit it.\n"
+    )
     return 0
 
 
 async def cmd_run(cfg: config_mod.Config) -> int:
-    db = DB(cfg.db_path)
-    client = await _connect_userbot(cfg, interactive=False)
+    db = await DB.connect(config_mod.require_database_url(cfg), cfg.account)
+    log.info("Postgres connected; account scope %r", cfg.account)
+
+    client = await _connect_userbot(cfg)
 
     bot = Bot(
         token=cfg.bot_token,
@@ -88,14 +111,33 @@ async def cmd_run(cfg: config_mod.Config) -> int:
     worker = SendWorker(cfg, db, client, on_event=notify)
     panel = Panel(cfg=cfg, db=db, client=client, worker=worker)
 
-    # A campaign left 'running' by a crash or restart is not actually running.
-    # Mark it honestly so the panel offers "продолжить" rather than lying.
-    stale = db.active_campaign()
+    # A campaign the database still calls 'running' is not running — this
+    # process just started. Recover it honestly so the panel offers Продолжить
+    # instead of claiming a send is in progress.
+    stale = await db.active_campaign()
     if stale is not None:
-        db.finish_campaign(
-            stale["id"], "stopped", "Процесс был перезапущен — рассылка не завершена."
+        freed = await db.release_inflight(stale["id"])
+        await db.finish_campaign(
+            stale["id"],
+            "stopped",
+            "Процесс был перезапущен (деплой или рестарт) — рассылка не завершена. "
+            "Нажми «Продолжить», чтобы дослать оставшимся.",
         )
-        log.warning("Campaign #%s was left running; marked stopped.", stale["id"])
+        log.warning(
+            "Campaign #%s was left running; marked stopped, %s in-flight requeued.",
+            stale["id"],
+            freed,
+        )
+        for admin_id in cfg.admin_ids:
+            try:
+                await bot.send_message(
+                    admin_id,
+                    f"♻️ Бот перезапущен. Рассылка #{stale['id']} была прервана — "
+                    f"прогресс сохранён в базе. Нажми «▶️ Продолжить», "
+                    f"чтобы дослать оставшимся.",
+                )
+            except Exception:  # noqa: BLE001
+                pass
 
     # Only the whitelist may touch the panel. Everyone else is ignored silently.
     allowed = set(cfg.admin_ids)
@@ -114,7 +156,7 @@ async def cmd_run(cfg: config_mod.Config) -> int:
             await asyncio.gather(worker.task, return_exceptions=True)
         await bot.session.close()
         await client.disconnect()
-        db.close()
+        await db.close()
     return 0
 
 
@@ -125,16 +167,18 @@ def main(argv: list[str] | None = None) -> int:
         "Telegram account to everyone you already have a dialogue with.",
     )
     sub = parser.add_subparsers(dest="command", required=True)
-    sub.add_parser("login", help="authorise the sending account (run this once)")
+    sub.add_parser(
+        "session", help="log in and print a TG_SESSION string (run this locally, once)"
+    )
     sub.add_parser("run", help="start the control bot and the sender")
 
     args = parser.parse_args(argv)
     cfg = config_mod.load()
-    handler = {"login": cmd_login, "run": cmd_run}[args.command]
+    handler = {"session": cmd_session, "run": cmd_run}[args.command]
     try:
         return asyncio.run(handler(cfg))
     except KeyboardInterrupt:
-        print("\nStopped. Progress is saved.")
+        print("\nStopped. Progress is in Postgres.")
         return 130
 
 

@@ -1,0 +1,10 @@
+.venv/
+.git/
+state/
+tests/
+*.session
+*.session-journal
+.env
+__pycache__/
+*.pyc
+README.md

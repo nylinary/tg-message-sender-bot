@@ -43,8 +43,9 @@ class Config:
     pacing: Pacing
     risk: Risk
     stale_after_hours: float
+    database_url: str
+    session_string: str | None
     session_path: Path
-    db_path: Path
 
 
 def _require(name: str) -> str:
@@ -65,6 +66,28 @@ def _admin_ids() -> frozenset[int]:
     return frozenset(ids)
 
 
+def require_database_url(cfg: "Config") -> str:
+    if not cfg.database_url:
+        raise SystemExit(
+            "DATABASE_URL is not set.\n"
+            "On Railway, reference the Postgres service: ${{Postgres.DATABASE_URL}}\n"
+            "Locally, point it at any Postgres instance."
+        )
+    return cfg.database_url
+
+
+def normalize_dsn(url: str) -> str:
+    """asyncpg rejects the SQLAlchemy-style schemes some hosts hand out."""
+    for prefix, replacement in (
+        ("postgresql+asyncpg://", "postgresql://"),
+        ("postgresql+psycopg2://", "postgresql://"),
+        ("postgres://", "postgresql://"),
+    ):
+        if url.startswith(prefix):
+            return replacement + url[len(prefix) :]
+    return url
+
+
 def load(config_path: Path | None = None) -> Config:
     path = config_path or ROOT / "config.toml"
     with open(path, "rb") as fh:
@@ -73,6 +96,11 @@ def load(config_path: Path | None = None) -> Config:
     account = os.environ.get("TG_ACCOUNT", "main").strip() or "main"
     state_dir = ROOT / raw["files"]["state_dir"] / account
     state_dir.mkdir(parents=True, exist_ok=True)
+
+    # A session string survives a redeploy; the .session file on disk does not.
+    # Local development can still use the file, but anything deployed must set
+    # TG_SESSION or it will ask for a login code nobody can type.
+    session_string = os.environ.get("TG_SESSION", "").strip() or None
 
     return Config(
         api_id=int(_require("TG_API_ID")),
@@ -85,6 +113,9 @@ def load(config_path: Path | None = None) -> Config:
         pacing=Pacing(**raw["pacing"]),
         risk=Risk(**raw["risk"]),
         stale_after_hours=float(raw["collect"]["stale_after_hours"]),
+        # Not required here: `session` runs before any database exists.
+        # `run` validates it via require_database_url().
+        database_url=normalize_dsn(os.environ.get("DATABASE_URL", "").strip()),
+        session_string=session_string,
         session_path=state_dir / f"{account}.session",
-        db_path=state_dir / "state.db",
     )

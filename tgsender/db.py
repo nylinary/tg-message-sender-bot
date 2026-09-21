@@ -1,45 +1,55 @@
 from __future__ import annotations
 
-import sqlite3
 import time
 from dataclasses import dataclass
-from pathlib import Path
+from typing import Any
+
+import asyncpg
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS recipients (
-    user_id         INTEGER PRIMARY KEY,
-    access_hash     INTEGER,
+    account         TEXT   NOT NULL,
+    user_id         BIGINT NOT NULL,
+    access_hash     BIGINT,
     username        TEXT,
     first_name      TEXT,
     last_name       TEXT,
-    last_message_at REAL,
-    collected_at    REAL NOT NULL
+    last_message_at DOUBLE PRECISION,
+    collected_at    DOUBLE PRECISION NOT NULL,
+    PRIMARY KEY (account, user_id)
 );
-CREATE INDEX IF NOT EXISTS idx_last_message ON recipients(last_message_at);
+CREATE INDEX IF NOT EXISTS idx_recipients_last
+    ON recipients(account, last_message_at);
 
 CREATE TABLE IF NOT EXISTS campaigns (
-    id          INTEGER PRIMARY KEY AUTOINCREMENT,
-    text        TEXT NOT NULL,
+    id          BIGSERIAL PRIMARY KEY,
+    account     TEXT NOT NULL,
+    body        TEXT NOT NULL,
     parse_mode  TEXT,
-    max_age_yrs REAL,
+    max_age_yrs DOUBLE PRECISION,
     status      TEXT NOT NULL DEFAULT 'draft',
-    created_by  INTEGER,
-    created_at  REAL NOT NULL,
-    started_at  REAL,
-    finished_at REAL,
+    created_by  BIGINT,
+    created_at  DOUBLE PRECISION NOT NULL,
+    started_at  DOUBLE PRECISION,
+    finished_at DOUBLE PRECISION,
     stop_reason TEXT,
-    delay       REAL
+    delay       DOUBLE PRECISION
 );
+CREATE INDEX IF NOT EXISTS idx_campaigns_account
+    ON campaigns(account, status, id DESC);
 
 CREATE TABLE IF NOT EXISTS deliveries (
-    campaign_id INTEGER NOT NULL,
-    user_id     INTEGER NOT NULL,
+    campaign_id BIGINT NOT NULL REFERENCES campaigns(id) ON DELETE CASCADE,
+    user_id     BIGINT NOT NULL,
     status      TEXT NOT NULL DEFAULT 'pending',
     error       TEXT,
-    sent_at     REAL,
+    sent_at     DOUBLE PRECISION,
     PRIMARY KEY (campaign_id, user_id)
 );
-CREATE INDEX IF NOT EXISTS idx_deliv ON deliveries(campaign_id, status);
+CREATE INDEX IF NOT EXISTS idx_deliveries_queue
+    ON deliveries(campaign_id, status);
+CREATE INDEX IF NOT EXISTS idx_deliveries_sent
+    ON deliveries(campaign_id, sent_at);
 """
 
 ACTIVE_STATUSES = ("running", "paused")
@@ -63,139 +73,173 @@ class Recipient:
         return name or (f"@{self.username}" if self.username else str(self.user_id))
 
 
-class DB:
-    def __init__(self, path: Path):
-        self.conn = sqlite3.connect(path, check_same_thread=False)
-        self.conn.row_factory = sqlite3.Row
-        self.conn.executescript(SCHEMA)
-        self.conn.commit()
+def _row_to_recipient(row: asyncpg.Record) -> Recipient:
+    return Recipient(
+        user_id=row["user_id"],
+        access_hash=row["access_hash"],
+        username=row["username"],
+        first_name=row["first_name"],
+        last_name=row["last_name"],
+        last_message_at=row["last_message_at"],
+    )
 
-    def close(self) -> None:
-        self.conn.close()
+
+class DB:
+    """Campaign state in Postgres.
+
+    Every delivery is committed the moment it happens, so a redeploy, crash or
+    restart loses at most the one message in flight — never the progress.
+    """
+
+    def __init__(self, pool: asyncpg.Pool, account: str):
+        self.pool = pool
+        self.account = account
+
+    @classmethod
+    async def connect(cls, dsn: str, account: str, *, min_size=1, max_size=5) -> DB:
+        pool = await asyncpg.create_pool(
+            dsn, min_size=min_size, max_size=max_size, command_timeout=30
+        )
+        async with pool.acquire() as conn:
+            await conn.execute(SCHEMA)
+        return cls(pool, account)
+
+    async def close(self) -> None:
+        await self.pool.close()
 
     # ------------------------------------------------------------------ #
     # recipients
     # ------------------------------------------------------------------ #
 
-    def upsert_recipient(self, rec: Recipient) -> None:
-        self.conn.execute(
+    async def upsert_recipients(self, batch: list[Recipient]) -> None:
+        if not batch:
+            return
+        now = time.time()
+        await self.pool.executemany(
             """
             INSERT INTO recipients
-                (user_id, access_hash, username, first_name, last_name,
+                (account, user_id, access_hash, username, first_name, last_name,
                  last_message_at, collected_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
-            ON CONFLICT(user_id) DO UPDATE SET
-                access_hash     = excluded.access_hash,
-                username        = excluded.username,
-                first_name      = excluded.first_name,
-                last_name       = excluded.last_name,
-                last_message_at = excluded.last_message_at,
-                collected_at    = excluded.collected_at
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+            ON CONFLICT (account, user_id) DO UPDATE SET
+                access_hash     = EXCLUDED.access_hash,
+                username        = EXCLUDED.username,
+                first_name      = EXCLUDED.first_name,
+                last_name       = EXCLUDED.last_name,
+                last_message_at = EXCLUDED.last_message_at,
+                collected_at    = EXCLUDED.collected_at
             """,
-            (
-                rec.user_id,
-                rec.access_hash,
-                rec.username,
-                rec.first_name,
-                rec.last_name,
-                rec.last_message_at,
-                time.time(),
-            ),
+            [
+                (
+                    self.account,
+                    r.user_id,
+                    r.access_hash,
+                    r.username,
+                    r.first_name,
+                    r.last_name,
+                    r.last_message_at,
+                    now,
+                )
+                for r in batch
+            ],
         )
 
-    def commit(self) -> None:
-        self.conn.commit()
+    async def recipients_total(self) -> int:
+        return await self.pool.fetchval(
+            "SELECT COUNT(*) FROM recipients WHERE account = $1", self.account
+        )
 
-    def recipients_total(self) -> int:
-        return self.conn.execute("SELECT COUNT(*) AS n FROM recipients").fetchone()["n"]
-
-    def last_collected_at(self) -> float | None:
-        row = self.conn.execute(
-            "SELECT MAX(collected_at) AS ts FROM recipients"
-        ).fetchone()
-        return row["ts"]
+    async def last_collected_at(self) -> float | None:
+        return await self.pool.fetchval(
+            "SELECT MAX(collected_at) FROM recipients WHERE account = $1", self.account
+        )
 
     def _selector(
-        self, max_age_years: float | None, exclude_sent: bool
-    ) -> tuple[str, list]:
-        """WHERE clause picking recipients for a filter. Shared by count and insert,
-        so the number shown in the panel is exactly the number queued."""
-        clauses: list[str] = []
-        params: list = []
+        self, max_age_years: float | None, exclude_sent: bool, start: int = 1
+    ) -> tuple[str, list[Any]]:
+        """WHERE clause picking recipients for a filter.
+
+        Shared by the count and the insert so the number the panel promises is
+        exactly the number that gets queued.
+        """
+        params: list[Any] = [self.account]
+        clauses = [f"r.account = ${start}"]
+        n = start
 
         if max_age_years is not None:
-            clauses.append("last_message_at IS NOT NULL AND last_message_at >= ?")
+            n += 1
+            clauses.append(
+                f"r.last_message_at IS NOT NULL AND r.last_message_at >= ${n}"
+            )
             params.append(time.time() - max_age_years * YEAR_SECONDS)
 
         if exclude_sent:
             # Nobody gets the invite twice because a run was restarted.
+            n += 1
             clauses.append(
-                "user_id NOT IN (SELECT user_id FROM deliveries WHERE status = 'sent')"
+                f"""NOT EXISTS (
+                    SELECT 1 FROM deliveries d
+                    JOIN campaigns c ON c.id = d.campaign_id
+                    WHERE d.user_id = r.user_id
+                      AND d.status = 'sent'
+                      AND c.account = ${n}
+                )"""
             )
+            params.append(self.account)
 
-        where = (" WHERE " + " AND ".join(clauses)) if clauses else ""
-        return where, params
+        return " WHERE " + " AND ".join(clauses), params
 
-    def count_by_age(
+    async def count_by_age(
         self, max_age_years: float | None, exclude_sent: bool = True
     ) -> int:
         where, params = self._selector(max_age_years, exclude_sent)
-        return self.conn.execute(
-            f"SELECT COUNT(*) AS n FROM recipients{where}", params
-        ).fetchone()["n"]
-
-    def already_sent_in_range(self, max_age_years: float | None) -> int:
-        """How many under this filter already received an earlier campaign."""
-        return self.count_by_age(max_age_years, exclude_sent=False) - self.count_by_age(
-            max_age_years, exclude_sent=True
+        return await self.pool.fetchval(
+            f"SELECT COUNT(*) FROM recipients r{where}", *params
         )
+
+    async def already_sent_in_range(self, max_age_years: float | None) -> int:
+        """How many under this filter already received an earlier campaign."""
+        total = await self.count_by_age(max_age_years, exclude_sent=False)
+        fresh = await self.count_by_age(max_age_years, exclude_sent=True)
+        return total - fresh
 
     # ------------------------------------------------------------------ #
     # campaigns
     # ------------------------------------------------------------------ #
 
-    def active_campaign(self) -> sqlite3.Row | None:
-        marks = ",".join("?" * len(ACTIVE_STATUSES))
-        return self.conn.execute(
-            f"SELECT * FROM campaigns WHERE status IN ({marks}) ORDER BY id DESC LIMIT 1",
-            ACTIVE_STATUSES,
-        ).fetchone()
+    async def active_campaign(self) -> asyncpg.Record | None:
+        return await self.pool.fetchrow(
+            "SELECT * FROM campaigns WHERE account = $1 AND status = ANY($2::text[]) "
+            "ORDER BY id DESC LIMIT 1",
+            self.account,
+            list(ACTIVE_STATUSES),
+        )
 
-    def latest_campaign(self) -> sqlite3.Row | None:
-        return self.conn.execute(
-            "SELECT * FROM campaigns ORDER BY id DESC LIMIT 1"
-        ).fetchone()
+    async def get_campaign(self, campaign_id: int) -> asyncpg.Record | None:
+        return await self.pool.fetchrow(
+            "SELECT * FROM campaigns WHERE id = $1 AND account = $2",
+            campaign_id,
+            self.account,
+        )
 
-    def resumable_campaign(self) -> sqlite3.Row | None:
+    async def resumable_campaign(self) -> asyncpg.Record | None:
         """A stopped campaign that still has people waiting in it."""
-        return self.conn.execute(
+        return await self.pool.fetchrow(
             """
             SELECT c.*, COUNT(d.user_id) AS pending_n
             FROM campaigns c
             JOIN deliveries d ON d.campaign_id = c.id AND d.status = 'pending'
-            WHERE c.status IN ('stopped', 'failed')
+            WHERE c.account = $1 AND c.status IN ('stopped', 'failed')
             GROUP BY c.id
             ORDER BY c.id DESC
             LIMIT 1
-            """
-        ).fetchone()
-
-    def reopen_campaign(self, campaign_id: int, delay: float) -> None:
-        self.conn.execute(
-            "UPDATE campaigns SET status = 'running', finished_at = NULL, "
-            "stop_reason = NULL, delay = ? WHERE id = ?",
-            (delay, campaign_id),
+            """,
+            self.account,
         )
-        self.conn.commit()
 
-    def get_campaign(self, campaign_id: int) -> sqlite3.Row | None:
-        return self.conn.execute(
-            "SELECT * FROM campaigns WHERE id = ?", (campaign_id,)
-        ).fetchone()
-
-    def create_campaign(
+    async def create_campaign(
         self,
-        text: str,
+        body: str,
         parse_mode: str | None,
         max_age_years: float | None,
         created_by: int,
@@ -203,110 +247,145 @@ class DB:
         exclude_sent: bool = True,
     ) -> int:
         """Create a campaign and freeze its recipient list in one transaction."""
-        where, params = self._selector(max_age_years, exclude_sent)
-        with self.conn:
-            cur = self.conn.execute(
+        async with self.pool.acquire() as conn, conn.transaction():
+            campaign_id = await conn.fetchval(
                 """
                 INSERT INTO campaigns
-                    (text, parse_mode, max_age_yrs, status, created_by, created_at, delay)
-                VALUES (?, ?, ?, 'running', ?, ?, ?)
+                    (account, body, parse_mode, max_age_yrs, status, created_by,
+                     created_at, started_at, delay)
+                VALUES ($1, $2, $3, $4, 'running', $5, $6, $6, $7)
+                RETURNING id
                 """,
-                (text, parse_mode, max_age_years, created_by, time.time(), delay),
+                self.account,
+                body,
+                parse_mode,
+                max_age_years,
+                created_by,
+                time.time(),
+                delay,
             )
-            campaign_id = cur.lastrowid
-            self.conn.execute(
+            where, params = self._selector(max_age_years, exclude_sent, start=2)
+            await conn.execute(
                 f"""
                 INSERT INTO deliveries (campaign_id, user_id, status)
-                SELECT ?, user_id, 'pending' FROM recipients{where}
+                SELECT $1, r.user_id, 'pending' FROM recipients r{where}
                 """,
-                [campaign_id, *params],
-            )
-            self.conn.execute(
-                "UPDATE campaigns SET started_at = ? WHERE id = ?",
-                (time.time(), campaign_id),
+                campaign_id,
+                *params,
             )
         return campaign_id
 
-    def finish_campaign(self, campaign_id: int, status: str, reason: str = "") -> None:
-        self.conn.execute(
-            "UPDATE campaigns SET status = ?, finished_at = ?, stop_reason = ? "
-            "WHERE id = ?",
-            (status, time.time(), reason[:500], campaign_id),
+    async def finish_campaign(
+        self, campaign_id: int, status: str, reason: str = ""
+    ) -> None:
+        await self.pool.execute(
+            "UPDATE campaigns SET status = $1, finished_at = $2, stop_reason = $3 "
+            "WHERE id = $4",
+            status,
+            time.time(),
+            reason[:500] or None,
+            campaign_id,
         )
-        self.conn.commit()
 
-    def set_campaign_delay(self, campaign_id: int, delay: float) -> None:
-        self.conn.execute(
-            "UPDATE campaigns SET delay = ? WHERE id = ?", (delay, campaign_id)
+    async def reopen_campaign(self, campaign_id: int, delay: float) -> None:
+        await self.pool.execute(
+            "UPDATE campaigns SET status = 'running', finished_at = NULL, "
+            "stop_reason = NULL, delay = $1 WHERE id = $2",
+            delay,
+            campaign_id,
         )
-        self.conn.commit()
+
+    async def set_campaign_delay(self, campaign_id: int, delay: float) -> None:
+        await self.pool.execute(
+            "UPDATE campaigns SET delay = $1 WHERE id = $2", delay, campaign_id
+        )
 
     # ------------------------------------------------------------------ #
     # deliveries
     # ------------------------------------------------------------------ #
 
-    def next_pending(self, campaign_id: int) -> Recipient | None:
-        row = self.conn.execute(
-            """
-            SELECT r.* FROM deliveries d
-            JOIN recipients r ON r.user_id = d.user_id
-            WHERE d.campaign_id = ? AND d.status = 'pending'
-            ORDER BY r.last_message_at DESC
-            LIMIT 1
-            """,
-            (campaign_id,),
-        ).fetchone()
-        if row is None:
-            return None
-        return Recipient(
-            user_id=row["user_id"],
-            access_hash=row["access_hash"],
-            username=row["username"],
-            first_name=row["first_name"],
-            last_name=row["last_name"],
-            last_message_at=row["last_message_at"],
-        )
+    async def claim_next(self, campaign_id: int) -> Recipient | None:
+        """Take the next pending recipient and mark it in-flight, atomically.
 
-    def mark(
-        self,
-        campaign_id: int,
-        user_id: int,
-        status: str,
-        error: str = "",
-    ) -> None:
-        self.conn.execute(
-            "UPDATE deliveries SET status = ?, error = ?, sent_at = ? "
-            "WHERE campaign_id = ? AND user_id = ?",
-            (
-                status,
-                error[:500] or None,
-                time.time() if status == "sent" else None,
+        SKIP LOCKED means that if a second worker ever races this one (an
+        overlapping deploy, say), the two cannot hand out the same person.
+        """
+        async with self.pool.acquire() as conn, conn.transaction():
+            row = await conn.fetchrow(
+                """
+                SELECT d.user_id FROM deliveries d
+                JOIN recipients r
+                  ON r.user_id = d.user_id AND r.account = $2
+                WHERE d.campaign_id = $1 AND d.status = 'pending'
+                ORDER BY r.last_message_at DESC NULLS LAST
+                FOR UPDATE OF d SKIP LOCKED
+                LIMIT 1
+                """,
                 campaign_id,
-                user_id,
-            ),
-        )
-        self.conn.commit()
+                self.account,
+            )
+            if row is None:
+                return None
+            await conn.execute(
+                "UPDATE deliveries SET status = 'sending' "
+                "WHERE campaign_id = $1 AND user_id = $2",
+                campaign_id,
+                row["user_id"],
+            )
+            full = await conn.fetchrow(
+                "SELECT * FROM recipients WHERE account = $1 AND user_id = $2",
+                self.account,
+                row["user_id"],
+            )
+        return _row_to_recipient(full) if full else None
 
-    def progress(self, campaign_id: int) -> dict[str, int]:
-        rows = self.conn.execute(
-            "SELECT status, COUNT(*) AS n FROM deliveries WHERE campaign_id = ? "
+    async def mark(
+        self, campaign_id: int, user_id: int, status: str, error: str = ""
+    ) -> None:
+        await self.pool.execute(
+            "UPDATE deliveries SET status = $1, error = $2, sent_at = $3 "
+            "WHERE campaign_id = $4 AND user_id = $5",
+            status,
+            error[:500] or None,
+            time.time() if status == "sent" else None,
+            campaign_id,
+            user_id,
+        )
+
+    async def release_inflight(self, campaign_id: int) -> int:
+        """Return anything left 'sending' by a crash to the queue."""
+        result = await self.pool.execute(
+            "UPDATE deliveries SET status = 'pending' "
+            "WHERE campaign_id = $1 AND status = 'sending'",
+            campaign_id,
+        )
+        return int(result.split()[-1]) if result else 0
+
+    async def progress(self, campaign_id: int) -> dict[str, int]:
+        rows = await self.pool.fetch(
+            "SELECT status, COUNT(*) AS n FROM deliveries WHERE campaign_id = $1 "
             "GROUP BY status",
-            (campaign_id,),
-        ).fetchall()
+            campaign_id,
+        )
         counts = {r["status"]: r["n"] for r in rows}
         counts["total"] = sum(counts.values())
+        # A message in flight is still owed to someone; show it as outstanding.
+        counts["pending"] = counts.get("pending", 0) + counts.get("sending", 0)
         return counts
 
-    def sent_since(self, campaign_id: int, since_ts: float) -> int:
-        return self.conn.execute(
-            "SELECT COUNT(*) AS n FROM deliveries WHERE campaign_id = ? "
-            "AND sent_at IS NOT NULL AND sent_at >= ?",
-            (campaign_id, since_ts),
-        ).fetchone()["n"]
+    async def sent_since(self, campaign_id: int, since_ts: float) -> int:
+        return await self.pool.fetchval(
+            "SELECT COUNT(*) FROM deliveries WHERE campaign_id = $1 "
+            "AND sent_at IS NOT NULL AND sent_at >= $2",
+            campaign_id,
+            since_ts,
+        )
 
-    def recent_errors(self, campaign_id: int, limit: int = 5) -> list[sqlite3.Row]:
-        return self.conn.execute(
-            "SELECT user_id, status, error FROM deliveries WHERE campaign_id = ? "
-            "AND error IS NOT NULL ORDER BY rowid DESC LIMIT ?",
-            (campaign_id, limit),
-        ).fetchall()
+    async def recent_errors(self, campaign_id: int, limit: int = 5) -> list:
+        return await self.pool.fetch(
+            "SELECT user_id, status, error FROM deliveries WHERE campaign_id = $1 "
+            "AND error IS NOT NULL ORDER BY sent_at DESC NULLS LAST, user_id DESC "
+            "LIMIT $2",
+            campaign_id,
+            limit,
+        )

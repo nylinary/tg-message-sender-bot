@@ -51,14 +51,14 @@ def kb(*rows: list[tuple[str, str]]) -> InlineKeyboardMarkup:
     )
 
 
-def main_menu(panel: Panel) -> InlineKeyboardMarkup:
+async def main_menu(panel: Panel) -> InlineKeyboardMarkup:
     if panel.worker.running:
         return kb(
             [("📊 Проверить статус", "status")],
             [("⏹ Остановить рассылку", "stop")],
         )
     rows = [[("📝 Новая рассылка", "new")]]
-    resumable = panel.db.resumable_campaign()
+    resumable = await panel.db.resumable_campaign()
     if resumable:
         rows.append(
             [(f"▶️ Продолжить #{resumable['id']} ({resumable['pending_n']} осталось)",
@@ -117,7 +117,7 @@ def age_from_callback(data: str) -> float | None:
 
 async def ensure_fresh(panel: Panel, status_msg: Message) -> None:
     """Rescan dialogues if the cache is empty or stale."""
-    last = panel.db.last_collected_at()
+    last = await panel.db.last_collected_at()
     fresh = last is not None and (time.time() - last) < panel.cfg.stale_after_hours * 3600
     if fresh:
         return
@@ -149,11 +149,11 @@ async def run_scan(panel: Panel, status_msg: Message) -> None:
         panel.scanning = False
 
 
-def status_text(panel: Panel) -> str:
-    snap = panel.worker.snapshot()
+async def status_text(panel: Panel) -> str:
+    snap = await panel.worker.snapshot()
     if not snap.get("campaign_id"):
-        total = panel.db.recipients_total()
-        last = panel.db.last_collected_at()
+        total = await panel.db.recipients_total()
+        last = await panel.db.last_collected_at()
         when = (
             datetime.fromtimestamp(last).strftime("%d.%m %H:%M") if last else "никогда"
         )
@@ -216,7 +216,7 @@ def status_text(panel: Panel) -> str:
     if snap["stop_reason"]:
         lines.append(f"\n<i>{snap['stop_reason']}</i>")
 
-    errors = panel.db.recent_errors(snap["campaign_id"])
+    errors = await panel.db.recent_errors(snap["campaign_id"])
     if errors:
         lines.append("\n<i>Последние ошибки:</i>")
         for e in errors:
@@ -234,14 +234,14 @@ def status_text(panel: Panel) -> str:
 async def cmd_start(message: Message, state: FSMContext, panel: Panel) -> None:
     await state.clear()
     running = panel.worker.running
-    total = panel.db.recipients_total()
+    total = await panel.db.recipients_total()
     await message.answer(
         "👋 <b>Панель рассылки приглашений</b>\n\n"
         f"Аккаунт-отправитель: <code>{panel.cfg.account}</code>\n"
         f"Диалогов в базе: <b>{total}</b>\n"
         f"Дедлайн: <b>{panel.cfg.deadline:%d.%m.%Y %H:%M}</b>\n\n"
         + ("🟢 Сейчас идёт рассылка." if running else "Готов к работе."),
-        reply_markup=main_menu(panel),
+        reply_markup=await main_menu(panel),
     )
 
 
@@ -250,7 +250,7 @@ async def cb_menu(cq: CallbackQuery, state: FSMContext, panel: Panel) -> None:
     await state.clear()
     await cq.answer()
     await safe_edit(
-        cq.message, "Главное меню.", main_menu(panel)
+        cq.message, "Главное меню.", await main_menu(panel)
     )
 
 
@@ -258,7 +258,7 @@ async def cb_menu(cq: CallbackQuery, state: FSMContext, panel: Panel) -> None:
 async def cb_cancel(cq: CallbackQuery, state: FSMContext, panel: Panel) -> None:
     await state.clear()
     await cq.answer("Отменено")
-    await safe_edit(cq.message, "Отменено.", main_menu(panel))
+    await safe_edit(cq.message, "Отменено.", await main_menu(panel))
 
 
 @router.callback_query(F.data == "new")
@@ -268,7 +268,7 @@ async def cb_new(cq: CallbackQuery, state: FSMContext, panel: Panel) -> None:
         await safe_edit(
             cq.message,
             "Уже идёт рассылка. Останови её, прежде чем начинать новую.",
-            main_menu(panel),
+            await main_menu(panel),
         )
         return
     await state.set_state(Compose.waiting_text)
@@ -296,9 +296,9 @@ async def on_text(message: Message, state: FSMContext, panel: Panel) -> None:
     status_msg = await message.answer("🔍 Проверяю список диалогов…")
     await ensure_fresh(panel, status_msg)
 
-    counts: dict[str | int, int] = {"all": panel.db.count_by_age(None)}
+    counts: dict[str | int, int] = {"all": await panel.db.count_by_age(None)}
     for years in panel.cfg.age_options:
-        counts[years] = panel.db.count_by_age(years)
+        counts[years] = await panel.db.count_by_age(years)
 
     await state.set_state(Compose.waiting_age)
     await safe_edit(
@@ -313,7 +313,7 @@ async def on_text(message: Message, state: FSMContext, panel: Panel) -> None:
 async def on_age(cq: CallbackQuery, state: FSMContext, panel: Panel) -> None:
     await cq.answer()
     years = age_from_callback(cq.data)
-    recipients = panel.db.count_by_age(years)
+    recipients = await panel.db.count_by_age(years)
 
     plan = build_plan(recipients, panel.cfg.deadline, panel.cfg.pacing, panel.cfg.risk)
     await state.update_data(max_age=years, delay=plan.delay)
@@ -325,7 +325,7 @@ async def on_age(cq: CallbackQuery, state: FSMContext, panel: Panel) -> None:
         preview = preview[:600] + "…"
 
     scope = "все диалоги" if years is None else f"последний диалог не старше {years:g} г."
-    already = panel.db.already_sent_in_range(years)
+    already = await panel.db.already_sent_in_range(years)
     excluded = (
         f"\n<i>Ещё {already} чел. под этот фильтр подходят, но уже получали "
         f"сообщение в прошлых рассылках — им не отправим.</i>\n"
@@ -357,14 +357,14 @@ async def on_go(cq: CallbackQuery, state: FSMContext, panel: Panel) -> None:
         await cq.answer("Рассылка уже идёт", show_alert=True)
         return
 
-    campaign_id = panel.db.create_campaign(
-        text=data["text"],
+    campaign_id = await panel.db.create_campaign(
+        body=data["text"],
         parse_mode=data["parse_mode"],
         max_age_years=data["max_age"],
         created_by=cq.from_user.id,
         delay=data["delay"],
     )
-    total = panel.db.progress(campaign_id).get("total", 0)
+    total = (await panel.db.progress(campaign_id)).get("total", 0)
     panel.worker.start(campaign_id)
 
     await cq.answer("Запущено")
@@ -375,7 +375,7 @@ async def on_go(cq: CallbackQuery, state: FSMContext, panel: Panel) -> None:
         f"Интервал: ~{humanize(data['delay'])}\n\n"
         "Можно закрыть бота — она идёт в фоне. "
         "Нажми «Статус», чтобы посмотреть прогресс.",
-        main_menu(panel),
+        await main_menu(panel),
     )
 
 
@@ -386,16 +386,16 @@ async def cb_resume(cq: CallbackQuery, state: FSMContext, panel: Panel) -> None:
         await cq.answer("Рассылка уже идёт", show_alert=True)
         return
 
-    campaign = panel.db.resumable_campaign()
+    campaign = await panel.db.resumable_campaign()
     if campaign is None:
         await cq.answer("Продолжать нечего", show_alert=True)
-        await safe_edit(cq.message, "Незавершённых рассылок нет.", main_menu(panel))
+        await safe_edit(cq.message, "Незавершённых рассылок нет.", await main_menu(panel))
         return
 
     # Re-derive the pace: the deadline is closer than when it first started.
     remaining = campaign["pending_n"]
     plan = build_plan(remaining, panel.cfg.deadline, panel.cfg.pacing, panel.cfg.risk)
-    panel.db.reopen_campaign(campaign["id"], plan.delay)
+    await panel.db.reopen_campaign(campaign["id"], plan.delay)
     panel.worker.start(campaign["id"])
 
     await cq.answer("Продолжаю")
@@ -411,7 +411,7 @@ async def cb_resume(cq: CallbackQuery, state: FSMContext, panel: Panel) -> None:
         f"Осталось: <b>{remaining}</b>\n"
         f"Новый интервал: ~{humanize(plan.delay)}"
         f"{warning}",
-        main_menu(panel),
+        await main_menu(panel),
     )
 
 
@@ -420,7 +420,7 @@ async def cb_status(cq: CallbackQuery, panel: Panel) -> None:
     await cq.answer()
     await safe_edit(
         cq.message,
-        status_text(panel),
+        await status_text(panel),
         kb(
             [("🔄 Обновить", "status")],
             *([[("⏹ Остановить", "stop")]] if panel.worker.running else []),
@@ -432,7 +432,7 @@ async def cb_status(cq: CallbackQuery, panel: Panel) -> None:
 @router.message(Command("status"))
 async def cmd_status(message: Message, panel: Panel) -> None:
     await message.answer(
-        status_text(panel),
+        await status_text(panel),
         reply_markup=kb([("🔄 Обновить", "status")], [("◀️ Меню", "menu")]),
     )
 
@@ -467,5 +467,5 @@ async def cb_rescan(cq: CallbackQuery, panel: Panel) -> None:
         f"✅ Готово.\n\nПросмотрено: <b>{c.get('scanned', 0)}</b>\n"
         f"Личных диалогов: <b>{c.get('saved', 0)}</b>\n"
         f"Пропущено (боты, каналы, группы): {c.get('skipped', 0)}",
-        main_menu(panel),
+        await main_menu(panel),
     )

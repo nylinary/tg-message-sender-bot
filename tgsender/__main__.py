@@ -48,6 +48,14 @@ async def _connect_userbot(cfg: config_mod.Config) -> TelegramClient:
             "Run `python -m tgsender session` locally, then set TG_SESSION."
         )
     me = await client.get_me()
+    if me.bot:
+        await client.disconnect()
+        raise SystemExit(
+            f"TG_SESSION is a BOT session (@{me.username}), not a personal account.\n"
+            f"A bot cannot list your dialogues and cannot message anyone who has "
+            f"not written to it first, so it can never send the invites.\n"
+            f"Re-run `python -m tgsender session` and enter your phone number."
+        )
     log.info(
         "Userbot ready: %s (@%s, id %s)", me.first_name or "?", me.username or "-", me.id
     )
@@ -83,11 +91,32 @@ async def _resolve_admin_usernames(client: TelegramClient, gate: AdminGate) -> N
 
 async def cmd_session(cfg: config_mod.Config) -> int:
     """Log in interactively and print a session string to paste into TG_SESSION."""
+    print("=" * 72)
+    print("Authorising the account the INVITES WILL BE SENT FROM.")
+    print("That is your personal account — the one with all the dialogues.")
+    print("This is NOT the bot: do not paste a @BotFather token here.")
+    print("=" * 72 + "\n")
+
     client = TelegramClient(StringSession(), cfg.api_id, cfg.api_hash)
-    await client.start()
+    await client.start(
+        phone=lambda: input("Phone number of your personal account (+79991234567): ")
+    )
     me = await client.get_me()
     string = client.session.save()
     await client.disconnect()
+
+    if me.bot:
+        # A bot cannot list your dialogues and cannot message anyone who has
+        # not written to it first, so this session could never send an invite.
+        print("\n" + "!" * 72)
+        print(f"This logged in as a BOT (@{me.username}), not as a person.")
+        print("A bot cannot see your dialogues and cannot start a conversation,")
+        print("so it can never deliver the invites.")
+        print("")
+        print("Run this again and enter your personal PHONE NUMBER at the prompt.")
+        print("The bot token belongs in BOT_TOKEN, nowhere else.")
+        print("!" * 72)
+        return 1
 
     print("\n" + "=" * 72)
     print(f"Authorised as {me.first_name or ''} (@{me.username or '-'}, id {me.id})")

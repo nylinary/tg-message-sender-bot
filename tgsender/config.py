@@ -48,10 +48,26 @@ class Config:
     session_path: Path
 
 
+HINTS = {
+    "TG_API_ID": "from https://my.telegram.org -> API development tools",
+    "TG_API_HASH": "from https://my.telegram.org -> API development tools",
+    "BOT_TOKEN": "from @BotFather",
+    "ADMIN_IDS": "your numeric Telegram id (ask @userinfobot), comma separated",
+}
+
+
 def _require(name: str) -> str:
     value = os.environ.get(name, "").strip()
     if not value:
-        raise SystemExit(f"{name} is not set — copy .env.example to .env and fill it in.")
+        where = (
+            "Set it in the Railway service variables."
+            if os.environ.get("RAILWAY_ENVIRONMENT")
+            else "Copy .env.example to .env and fill it in."
+        )
+        hint = HINTS.get(name)
+        raise SystemExit(
+            f"{name} is not set. {where}" + (f"\n  ({hint})" if hint else "")
+        )
     return value
 
 

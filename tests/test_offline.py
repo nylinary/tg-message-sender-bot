@@ -195,6 +195,9 @@ assert s.deadline == datetime(2026, 9, 24, 20, 0, tzinfo=ZoneInfo("Asia/Almaty")
 s = st.resolve({"interval": "1", "jitter": "5", "timezone": "Nope/Nope", "deadline": "?"}, cfg)
 assert s.interval == cfg.pacing.min_interval and s.jitter == st.MAX_JITTER
 assert s.timezone == "Europe/Moscow" and s.deadline.hour == 21
+assert st.resolve({}, cfg).night_mode == "silent" and not st.resolve({}, cfg).pause_at_night
+assert st.resolve({"night_mode": "pause"}, cfg).pause_at_night
+assert st.resolve({"night_mode": "loud"}, cfg).night_mode == "silent", "unknown mode → default"
 ok("settings: defaults, stored overrides, corrupt values fall back safely")
 
 # --------------------------------------------------------------------------- #
@@ -235,6 +238,17 @@ assert "Даже на минимальном" in sch.describe(huge, p, r, "UTC")
 for n in (0, 1, 2, 100, 5000):
     sch.describe(sch.estimate(n, 180, 0.35, deadline, p, r, base), p, r, "UTC")
 ok("estimate: risk bands, past deadline, zero, impossible volume")
+
+paused = sch.estimate(10**6, 180, 0.35, deadline, p, r, base, pause_at_night=True)
+nightly = sch.estimate(10**6, 180, 0.35, deadline, p, r, base, pause_at_night=False)
+assert nightly.capacity > paused.capacity * 1.7, (paused.capacity, nightly.capacity)
+assert abs(nightly.per_day / paused.per_day - 24 / 13) < 1e-6
+assert "шлём без звука" in sch.describe(nightly, p, r, "UTC", pause_at_night=False)
+assert "не шлём" in sch.describe(paused, p, r, "UTC", pause_at_night=True)
+late = base.replace(hour=22, minute=30)
+assert sch.estimate(3, 1800, 0, deadline, p, r, late, pause_at_night=False).finishes_at == \
+    late + timedelta(hours=1), "sending through the night does not skip it"
+ok(f"night silent: 24 h of sending, reach {paused.capacity} → {nightly.capacity} by deadline")
 
 # --------------------------------------------------------------------------- #
 # panel helpers and error classes

@@ -102,8 +102,10 @@ def estimate(
     pacing: Pacing,
     risk_cfg: Risk,
     now: datetime,
+    pause_at_night: bool = True,
 ) -> Estimate:
-    qs, qe = pacing.quiet_start, pacing.quiet_end
+    # Sending silently at night means the night is ordinary sending time.
+    qs, qe = (pacing.quiet_start, pacing.quiet_end) if pause_at_night else (0, 0)
     # Jitter is symmetric, so on average it cancels; the long breaks do not.
     long_break = (pacing.long_pause_min + pacing.long_pause_max) / 2
     per_message = interval + long_break / max(1, pacing.long_pause_every)
@@ -157,8 +159,15 @@ def humanize(seconds: float) -> str:
     return f"{seconds // 86400} д {(seconds % 86400) // 3600} ч"
 
 
-def describe(est: Estimate, pacing: Pacing, risk_cfg: Risk, timezone: str) -> str:
+def describe(
+    est: Estimate,
+    pacing: Pacing,
+    risk_cfg: Risk,
+    timezone: str,
+    pause_at_night: bool = True,
+) -> str:
     """The pace and deadline block shown before launching."""
+    night = "не шлём" if pause_at_night else "шлём без звука"
     lo, hi = est.interval * (1 - est.jitter), est.interval * (1 + est.jitter)
     lines = [
         f"👥 Получателей: <b>{est.recipients}</b>",
@@ -166,7 +175,7 @@ def describe(est: Estimate, pacing: Pacing, risk_cfg: Risk, timezone: str) -> st
         + (f" ±{est.jitter * 100:.0f}% <i>({humanize(lo)}–{humanize(hi)})</i>"
            if est.jitter else ""),
         f"📈 Темп: ~<b>{est.per_hour:.0f}/час</b>, ~<b>{est.per_day:.0f}/сутки</b>",
-        f"🌙 Ночью не шлём: {pacing.quiet_start:02d}:00–{pacing.quiet_end:02d}:00 "
+        f"🌙 Ночью {night}: {pacing.quiet_start:02d}:00–{pacing.quiet_end:02d}:00 "
         f"<i>({timezone})</i>",
         f"🏁 Дедлайн: <b>{est.deadline:%d.%m %H:%M}</b>",
     ]

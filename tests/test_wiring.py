@@ -96,9 +96,11 @@ class FakeTelegram(BaseSession):
 class FakeUserbot:
     def __init__(self):
         self.sent: list = []
+        self.silent: list = []
 
     async def send_message(self, peer, text, **kw):
         self.sent.append((peer, text))
+        self.silent.append(kw.get("silent", False))
 
 
 def update(bot, *, user=ADMIN, text=None, data=None):
@@ -249,6 +251,7 @@ async def main() -> None:
             await worker.task
         assert userbot.sent, "the userbot actually sent"
         assert userbot.sent[0][1] == "Приглашение на вечеринку 🎉"
+        assert userbot.silent[0] is False, "daytime messages ring normally"
         progress = await db.progress(worker.campaign_id)
         assert progress.get("sent", 0) == len(userbot.sent)
         ok(f"launch sends through the userbot ({len(userbot.sent)} before stop), "
@@ -310,6 +313,42 @@ async def main() -> None:
         assert len(userbot.sent) == before, "nothing is sent after the deadline"
         assert (await db.progress(cid)).get("pending") == 5, "nobody lost, all resumable"
         ok("past the deadline the sender stops before sending, keeping everyone pending")
+
+        # ---------------- night: silent vs pause ----------------
+        await db.set_setting("deadline", (s.now() + timedelta(days=1))
+                             .replace(tzinfo=None).isoformat(timespec="minutes"))
+        offset = 2 - datetime.now(timezone.utc).hour          # 02:00 local
+        offset = (offset + 12) % 24 - 12
+        await db.set_setting(
+            "timezone",
+            "UTC" if offset == 0 else f"Etc/GMT{'-' if offset > 0 else '+'}{abs(offset)}",
+        )
+        await press("set")
+        assert "без звука (23:00–10:00)" in tg.last_screen(), tg.last_screen()
+
+        async def run_briefly():
+            before = len(userbot.sent)
+            cid = await db.create_campaign("ночь", None, Filter(), ADMIN, 10.0,
+                                           exclude_sent=False)
+            worker.start(cid)
+            for _ in range(20):
+                if len(userbot.sent) > before:
+                    break
+                await asyncio.sleep(0.1)
+            worker.request_stop()
+            await worker.task
+            return userbot.silent[before:]
+
+        sent = await run_briefly()
+        assert sent == [True], f"at 02:00 the message goes out silently: {sent}"
+
+        await press("set:night")
+        assert "не отправляем (23:00–10:00)" in tg.last_screen()
+        assert (await db.get_settings())["night_mode"] == "pause"
+        assert await run_briefly() == [], "in pause mode nothing is sent at night"
+        await press("set:night")
+        assert (await db.get_settings())["night_mode"] == "silent"
+        ok("night: silent mode sends with silent=True at 02:00; pause mode sends nothing")
 
     finally:
         if worker.running:

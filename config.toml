@@ -13,9 +13,13 @@ jitter       = 0.35
 # Nobody can set the interval below this; Telegram answers FLOOD_WAIT anyway.
 min_interval = 10
 
-# No sending between these hours, local to `timezone`.
+# Night hours, local to `timezone`, and what happens during them:
+#   "silent" — keep sending, but the notification arrives without sound
+#   "pause"  — send nothing until morning
+# Changeable from the bot (⚙️ Настройки).
 quiet_start = 23
 quiet_end   = 10
+night_mode  = "silent"
 
 # An extra pause after every N messages.
 long_pause_every = 60

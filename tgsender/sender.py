@@ -114,7 +114,7 @@ class SendWorker:
                 # Pace first, claim second: a claimed recipient is marked
                 # in-flight, and holding one across a long sleep would strand
                 # them if the process died mid-wait.
-                if not await self._wait_out_quiet_hours(s):
+                if s.pause_at_night and not await self._wait_out_quiet_hours(s):
                     return await self._finish(campaign_id, "stopped", stopped)
 
                 if sent_in_run and sent_in_run % p.long_pause_every == 0:
@@ -132,14 +132,19 @@ class SendWorker:
                 s = await settings_mod.load(self.db, self.cfg)
                 if s.now() >= s.deadline:
                     return await self._deadline_reached(campaign_id, s)
-                if is_quiet(s.now().hour, p.quiet_start, p.quiet_end):
+                night = is_quiet(s.now().hour, p.quiet_start, p.quiet_end)
+                if night and s.pause_at_night:
                     continue
 
                 recipient = await self.db.claim_next(campaign_id)
                 if recipient is None:
                     return await self._finish(campaign_id, "done", "")
 
-                outcome = await self._send_one(campaign_id, recipient, text, parse_mode)
+                # At night the message still goes out, but without sound or
+                # vibration on the recipient's phone.
+                outcome = await self._send_one(
+                    campaign_id, recipient, text, parse_mode, silent=night
+                )
                 recipient = None
                 if outcome == "hard_stop":
                     return
@@ -167,7 +172,9 @@ class SendWorker:
             f"⚙️ Настройках и нажми «Продолжить».",
         )
 
-    async def _send_one(self, campaign_id, recipient, text, parse_mode) -> str:
+    async def _send_one(
+        self, campaign_id, recipient, text, parse_mode, *, silent: bool = False
+    ) -> str:
         peer = (
             InputPeerUser(recipient.user_id, recipient.access_hash)
             if recipient.access_hash is not None
@@ -175,7 +182,7 @@ class SendWorker:
         )
         try:
             await self.client.send_message(
-                peer, text, parse_mode=parse_mode, link_preview=True
+                peer, text, parse_mode=parse_mode, link_preview=True, silent=silent
             )
         except errors.FloodWaitError as exc:
             # Not this recipient's fault — put them back in the queue.

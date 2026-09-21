@@ -84,7 +84,8 @@ running** — the sender re-reads them before every message.
 | 🏁 Дедлайн | 25.09.2026 21:00 | Sending stops when it passes; the unsent stay resumable |
 | ⏱ Интервал | 180 s | Pause between two messages; floor 10 s |
 | 🎲 Джиттер | ±35% | Each pause is randomised: 180 s ±35% = 117–243 s |
-| 🌍 Часовой пояс | Europe/Moscow | Deadline and quiet hours are read in this zone |
+| 🌍 Часовой пояс | Europe/Moscow | Deadline and night hours are read in this zone |
+| 🌙 Ночью | без звука | 23:00–10:00: keep sending silently, or send nothing |
 
 The deadline is stored as local wall-clock time, so «21:00» keeps meaning 21:00
 wherever you set the timezone.
@@ -92,6 +93,20 @@ wherever you set the timezone.
 **Why the timezone matters:** the Railway container runs in UTC. Before this
 setting existed, quiet hours 23:00–10:00 and the 21:00 deadline were
 silently applied in UTC — three hours off from Moscow.
+
+### Night: silent or paused
+
+Between 23:00 and 10:00 (in your timezone) the bot either:
+
+- **sends silently** (default) — `silent=True`, the same flag as Telegram's
+  «Отправить без звука». The message arrives normally; the notification makes
+  no sound or vibration. Daytime messages ring as usual.
+- **sends nothing** until morning.
+
+Silent nights nearly double what a day can deliver — 24 sendable hours instead
+of 13. Two things to weigh: the banner still appears on the lock screen, just
+quietly; and an account that sends around the clock looks less like a person
+than one that stops at night.
 
 ### Why jitter
 
@@ -106,28 +121,29 @@ and not being reported, which is why the defaults are slow.
 Before 🚀 the panel shows what the chosen interval means against the deadline:
 
 ```
-👥 Получателей: 1400
+👥 Получателей: 2500
 ⏱ Интервал: 3 мин ±35% (1 мин 57 с–4 мин 3 с)
-📈 Темп: ~20/час, ~256/сутки
-🌙 Ночью не шлём: 23:00–10:00 (Europe/Moscow)
+📈 Темп: ~20/час, ~473/сутки
+🌙 Ночью шлём без звука: 23:00–10:00 (Europe/Moscow)
 🏁 Дедлайн: 25.09 21:00
 
-⛔️ Не успеваем. До дедлайна уйдёт ~1143 из 1400, остальным ~257 — нет: в дедлайн рассылка остановится.
-Чтобы успеть всем, нужен интервал ~2 мин 26 с — или сузь фильтр, или сдвинь дедлайн.
-🟢 Темп спокойный.
+⛔️ Не успеваем. До дедлайна уйдёт ~2010 из 2500, остальным ~490 — нет: в дедлайн рассылка остановится.
+Чтобы успеть всем, нужен интервал ~2 мин 24 с — или сузь фильтр, или сдвинь дедлайн.
+
+🟡 Темп выше спокойного (300/сутки). Обычно проходит на прогретом аккаунте.
 ```
 
-(Rendered from the code for 1,400 people at 15:00 on 21.09.)
+(Rendered from the code for 2,500 people at 15:00 on 21.09.)
 
-From 21.09 15:00 to a 25.09 21:00 deadline, this is how many people each
-interval reaches:
+How many people each interval reaches from 21.09 15:00 to a 25.09 21:00
+deadline:
 
-| Интервал | Per day | Reached by deadline | |
-| --- | --- | --- | --- |
-| 60 s | ~746 | ~3,300 | 🔴 |
-| 120 s | ~381 | ~1,700 | 🟡 |
-| **180 s** | **~256** | **~1,140** | 🟢 |
-| 300 s | ~155 | ~690 | 🟢 |
+| Интервал | Night silent: per day | reached | Night paused: per day | reached |
+| --- | --- | --- | --- | --- |
+| 60 s | ~1,377 🔴 | ~5,850 | ~746 🔴 | ~3,330 |
+| 120 s | ~704 🔴 | ~2,990 | ~381 🟡 | ~1,700 |
+| **180 s** | **~473 🟡** | **~2,010** | ~256 🟢 | ~1,140 |
+| 300 s | ~285 🟢 | ~1,210 | ~155 🟢 | ~690 |
 
 The colour is about the account, not the clock: a warmed-up account is
 comfortable around 200–300/day, and limits tend to land above 600/day.
@@ -141,7 +157,7 @@ comfortable around 200–300/day, and limits tend to land above 600/day.
 | `recipients` | Dialogue scan: who, when you last spoke, guessed gender |
 | `campaigns` | Text, filter, status, stop reason |
 | `deliveries` | One row per recipient per campaign: `pending` → `sending` → `sent` / `skipped` / `failed` |
-| `settings` | Deadline, interval, jitter, timezone |
+| `settings` | Deadline, interval, jitter, timezone, night mode |
 
 Every delivery is committed as it happens. A redeploy loses at most the message
 in flight, and that is requeued on the next boot; the panel then offers
@@ -184,9 +200,10 @@ Anyone else is ignored silently.
 | `PEER_FLOOD` | Stop — retrying is what makes a limit permanent |
 | `USER_PRIVACY_RESTRICTED` | Skip that person, continue |
 | Deadline passed | Stop before the next message; the rest stay resumable |
+| Night, silent mode | Message sent with `silent=True` — no sound on their phone |
 
-Always on: quiet hours 23:00–10:00 in your timezone, and a longer pause every
-60 messages.
+Always on: silent or paused nights (23:00–10:00 in your timezone), and a
+longer pause every 60 messages.
 
 ## Running locally
 

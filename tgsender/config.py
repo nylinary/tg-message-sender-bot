@@ -20,6 +20,7 @@ class Pacing:
     min_interval: float
     quiet_start: int
     quiet_end: int
+    night_mode: str
     long_pause_every: int
     long_pause_min: float
     long_pause_max: float

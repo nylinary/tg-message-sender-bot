@@ -21,6 +21,12 @@ from .config import Config
 MAX_INTERVAL = 6 * 3600
 MAX_JITTER = 0.9
 
+NIGHT_SILENT, NIGHT_PAUSE = "silent", "pause"
+NIGHT_MODES = {
+    NIGHT_SILENT: "ночью отправлять без звука",
+    NIGHT_PAUSE: "ночью не отправлять",
+}
+
 
 class SettingError(ValueError):
     """Raised with a message that can be shown to the user as-is."""
@@ -32,6 +38,11 @@ class Settings:
     interval: float      # seconds between messages
     jitter: float        # fraction, 0.35 = ±35%
     timezone: str
+    night_mode: str = NIGHT_SILENT
+
+    @property
+    def pause_at_night(self) -> bool:
+        return self.night_mode == NIGHT_PAUSE
 
     @property
     def tz(self) -> ZoneInfo:
@@ -75,7 +86,9 @@ def resolve(raw: dict[str, str], cfg: Config) -> Settings:
     interval = min(MAX_INTERVAL, max(cfg.pacing.min_interval,
                                      number("interval", cfg.pacing.interval)))
     jitter = min(MAX_JITTER, max(0.0, number("jitter", cfg.pacing.jitter)))
-    return Settings(wall.replace(tzinfo=tz), interval, jitter, timezone)
+    default_night = cfg.pacing.night_mode if cfg.pacing.night_mode in NIGHT_MODES else NIGHT_SILENT
+    night = raw.get("night_mode") if raw.get("night_mode") in NIGHT_MODES else default_night
+    return Settings(wall.replace(tzinfo=tz), interval, jitter, timezone, night)
 
 
 async def load(db, cfg: Config) -> Settings:

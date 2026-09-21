@@ -231,6 +231,7 @@ async def home_text(panel: Panel) -> str:
         f"Диалогов в базе: <b>{total}</b>\n"
         f"🏁 Дедлайн: <b>{s.deadline:%d.%m.%Y %H:%M}</b>\n"
         f"⏱ Интервал: <b>{humanize(s.interval)}</b> ±{s.jitter * 100:.0f}%\n"
+        f"🌙 Ночью: {night_text(panel, s)}\n"
         f"🌍 {s.timezone}, сейчас {s.now():%H:%M}\n\n"
         + ("🟢 Сейчас идёт рассылка." if panel.worker.running else "Готов к работе.")
     )
@@ -314,7 +315,7 @@ async def confirm_view(panel: Panel, state: FSMContext) -> tuple[str, InlineKeyb
     already = await panel.db.already_sent_in_range(flt)
     est = estimate(
         recipients, s.interval, s.jitter, s.deadline,
-        panel.cfg.pacing, panel.cfg.risk, s.now(),
+        panel.cfg.pacing, panel.cfg.risk, s.now(), s.pause_at_night,
     )
 
     preview = data.get("text", "")
@@ -327,7 +328,7 @@ async def confirm_view(panel: Panel, state: FSMContext) -> tuple[str, InlineKeyb
     body = (
         "<b>Проверь перед запуском</b>\n\n"
         f"Фильтр: {flt.summary()}\n{excluded}\n"
-        f"{describe(est, panel.cfg.pacing, panel.cfg.risk, s.timezone)}\n\n"
+        f"{describe(est, panel.cfg.pacing, panel.cfg.risk, s.timezone, s.pause_at_night)}\n\n"
         f"<i>Интервал, джиттер и дедлайн можно менять в ⚙️ Настройках "
         f"и во время рассылки.</i>\n\n"
         f"─────────\n{preview}"
@@ -357,13 +358,18 @@ async def settings_view(panel: Panel) -> tuple[str, InlineKeyboardMarkup]:
         f"🎲 Джиттер: <b>±{s.jitter * 100:.0f}%</b> → каждая пауза от "
         f"{humanize(lo)} до {humanize(hi)}\n"
         f"🌍 Часовой пояс: <b>{s.timezone}</b> (сейчас {s.now():%d.%m %H:%M})\n"
-        f"🌙 Тихие часы: {p.quiet_start:02d}:00–{p.quiet_end:02d}:00\n\n"
+        f"🌙 Ночью: <b>{night_text(panel, s)}</b>\n\n"
         "<i>Изменения действуют сразу, в том числе на идущую рассылку. "
         "После дедлайна отправка останавливается.</i>"
     )
     return text, kb(
         [("🏁 Дедлайн", "set:dl"), ("⏱ Интервал", "set:int")],
         [("🎲 Джиттер", "set:jit"), ("🌍 Часовой пояс", "set:tz")],
+        [(
+            "🌙 Переключить: ночью не отправлять" if not s.pause_at_night
+            else "🌙 Переключить: ночью слать без звука",
+            "set:night",
+        )],
         [("◀️ Меню", "menu")],
     )
 
@@ -407,6 +413,12 @@ def timezone_keyboard() -> InlineKeyboardMarkup:
     buttons = [(label, f"set:tz:{zone}") for label, zone in TIMEZONE_PRESETS]
     rows = [buttons[i:i + 3] for i in range(0, len(buttons), 3)]
     return kb(*rows, [("✏️ Другой", "set:tz:custom")], [("◀️ Настройки", "set")])
+
+
+def night_text(panel: Panel, s: settings_mod.Settings) -> str:
+    p = panel.cfg.pacing
+    hours = f"{p.quiet_start:02d}:00–{p.quiet_end:02d}:00"
+    return f"не отправляем ({hours})" if s.pause_at_night else f"без звука ({hours})"
 
 
 async def save_setting(panel: Panel, key: str, value: str, user_id: int) -> None:
@@ -472,7 +484,7 @@ async def status_text(panel: Panel) -> str:
     if snap["running"] and pending:
         est = estimate(
             pending, s.interval * snap["multiplier"], s.jitter, s.deadline,
-            panel.cfg.pacing, panel.cfg.risk, s.now(),
+            panel.cfg.pacing, panel.cfg.risk, s.now(), s.pause_at_night,
         )
         lines.append(f"Закончит примерно: <b>{est.finishes_at:%d.%m %H:%M}</b>")
         if not est.fits:
@@ -747,7 +759,7 @@ async def cb_resume(cq: CallbackQuery, state: FSMContext, panel: Panel) -> None:
     remaining = campaign["pending_n"]
     est = estimate(
         remaining, s.interval, s.jitter, s.deadline,
-        panel.cfg.pacing, panel.cfg.risk, s.now(),
+        panel.cfg.pacing, panel.cfg.risk, s.now(), s.pause_at_night,
     )
     if est.seconds_available <= 0:
         await cq.answer(
@@ -847,6 +859,14 @@ async def cb_setting(cq: CallbackQuery, state: FSMContext, panel: Panel) -> None
     what = parts[1]
     value = parts[2] if len(parts) > 2 else None
 
+    if what == "night":
+        s = await load_settings(panel)
+        new = settings_mod.NIGHT_SILENT if s.pause_at_night else settings_mod.NIGHT_PAUSE
+        await save_setting(panel, "night_mode", new, cq.from_user.id)
+        await cq.answer(settings_mod.NIGHT_MODES[new].capitalize())
+        text, markup = await settings_view(panel)
+        await safe_edit(cq.message, text, markup)
+        return
     if value is None and what == "int":
         await cq.answer()
         await safe_edit(cq.message, "⏱ <b>Интервал между сообщениями</b>", interval_keyboard())

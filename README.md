@@ -1,204 +1,227 @@
 # tgsender
 
-A private Telegram bot that mails one invite, unchanged, to everyone you
-already have a dialogue with — sent from your own account, paced to land by a
-deadline you set.
+A private Telegram bot that mails one invite, unchanged, to people you already
+have a dialogue with — sent from your own account, filtered by how recently you
+spoke and by (guessed) gender, paced at an interval you choose, and stopped at
+a deadline.
 
 Two Telegram identities, two different jobs:
 
-- **The control bot** (`BOT_TOKEN`, made with @BotFather) is the panel you and
-  your friends press buttons in. It is whitelisted to specific user IDs and
-  never messages a guest.
-- **The userbot** (`TG_API_ID` / `TG_API_HASH`, your personal account over
-  MTProto) is what actually sends. Telegram bots cannot start a conversation
-  with someone who has not written to them first, which is exactly why the
-  sending has to come from your account.
+- **The control bot** (`BOT_TOKEN`, from @BotFather) is the panel you and your
+  friends press buttons in. It is whitelisted and never messages a guest.
+- **The userbot** (`TG_API_ID` / `TG_API_HASH` / `TG_SESSION`, your personal
+  account over MTProto) does the sending. Bots cannot start conversations,
+  which is why the sending has to come from your account.
 
-## How it works
+## The panel
 
 ```
 /start
-  └─ 📝 Новая рассылка
-       └─ you send the invite text          → saved as-is, formatting kept
-            └─ pick a filter                → "last dialogue no older than 1 / 2 / 3 years / all"
-                 └─ the panel computes      → recipients, interval, per-hour, per-day, risk
-                      └─ 🚀 Запустить       → sends in the background
-                           └─ 📊 Статус     → progress bar, rate, ETA, errors
-                                ⏹ Остановить → stops; ▶️ Продолжить picks up where it left off
+ ├─ 📝 Новая рассылка → текст → фильтр → ➡️ Далее → проверка → 🚀 Запустить
+ ├─ 🔎 Посчитать получателей → тот же фильтр, без запуска
+ │                              └─ 📝 Разослать этим людям → текст → проверка
+ ├─ ▶️ Продолжить #N          (если рассылка была остановлена)
+ ├─ 📊 Статус  ·  ⚙️ Настройки
+ └─ 🔄 Пересканировать диалоги
 ```
 
-The message goes out **identical to everyone**. No names, no substitutions.
+### The filter
+
+One builder serves both 🔎 Посчитать and 📝 Новая рассылка, so the number you
+count is exactly the list a campaign freezes.
+
+- **Период последнего диалога** — buttons for 3/6 months and 1/2/3 years, «Все»,
+  or ✏️ type your own:
+
+  | You type | Means |
+  | --- | --- |
+  | `2г` | last 2 years |
+  | `30д-1г` | between 30 days and 1 year ago |
+  | `7-90` | between 7 and 90 days ago (no unit = days) |
+  | `1г-` | longer ago than a year |
+  | `01.03.2025-01.09.2026` | between two dates, inclusive |
+  | `01.03.2025` | since that date |
+
+  Units: `д`, `н`, `м`, `г`. Dialogues Telegram gave no date for appear only
+  under «Все».
+
+- **Пол** — three toggles, ♀ / ♂ / ❔, any combination except none. The screen
+  always shows all three counts for the chosen period, so you can see what each
+  toggle adds.
+
+- **👀 Кто попал** — 25 random people from the current selection with their
+  guessed gender and last-dialogue date. Use it to judge how wrong the gender
+  guess is on *your* contacts before trusting it.
+
+People who already received an earlier campaign are excluded automatically,
+and the screen says how many.
+
+### Gender is a guess
+
+Telegram has no gender field. `tgsender/gender.py` guesses from the display
+name, strongest evidence first:
+
+1. a known first name — Russian, Kazakh and common Latin spellings, with
+   diminutives (Анна, Маша, Айгерим, Kostya…)
+2. a gendered surname or patronymic — `-ова/-ов`, `-ская/-ский`, `-овна/-ович`,
+   `-қызы/-ұлы`
+3. the shape of the first word — `-а/-я` → ♀, consonant → ♂, skipping male
+   names like Никита and Илья
+
+Genuinely ambiguous names (Саша, Женя, Валя, Слава) go to ❔ unless a surname
+settles it. Nicknames, emoji-only names and «Мама» will be wrong sometimes;
+that is the cost of guessing, and why ❔ is a toggle rather than silently
+dropped.
+
+## ⚙️ Настройки
+
+Stored in Postgres per account; defaults come from `config.toml`.
+**Changes apply immediately, including to a campaign that is already
+running** — the sender re-reads them before every message.
+
+| Setting | Default | Notes |
+| --- | --- | --- |
+| 🏁 Дедлайн | 25.09.2026 21:00 | Sending stops when it passes; the unsent stay resumable |
+| ⏱ Интервал | 180 s | Pause between two messages; floor 10 s |
+| 🎲 Джиттер | ±35% | Each pause is randomised: 180 s ±35% = 117–243 s |
+| 🌍 Часовой пояс | Europe/Moscow | Deadline and quiet hours are read in this zone |
+
+The deadline is stored as local wall-clock time, so «21:00» keeps meaning 21:00
+wherever you set the timezone.
+
+**Why the timezone matters:** the Railway container runs in UTC. Before this
+setting existed, quiet hours 23:00–10:00 and the 21:00 deadline were
+silently applied in UTC — three hours off from Moscow.
+
+### Why jitter
+
+A message exactly every 180 s is a machine signature; people do not type on a
+metronome. Jitter varies each gap so the account's rhythm looks like a person
+working through a list. It does not raise throughput or get around any limit —
+the average pace is the same. What keeps an account safe is the pace itself
+and not being reported, which is why the defaults are slow.
+
+## The launch screen
+
+Before 🚀 the panel shows what the chosen interval means against the deadline:
+
+```
+👥 Получателей: 1400
+⏱ Интервал: 3 мин ±35% (1 мин 57 с–4 мин 3 с)
+📈 Темп: ~20/час, ~256/сутки
+🌙 Ночью не шлём: 23:00–10:00 (Europe/Moscow)
+🏁 Дедлайн: 25.09 21:00
+
+⛔️ Не успеваем. До дедлайна уйдёт ~1143 из 1400, остальным ~257 — нет: в дедлайн рассылка остановится.
+Чтобы успеть всем, нужен интервал ~2 мин 26 с — или сузь фильтр, или сдвинь дедлайн.
+🟢 Темп спокойный.
+```
+
+(Rendered from the code for 1,400 people at 15:00 on 21.09.)
+
+From 21.09 15:00 to a 25.09 21:00 deadline, this is how many people each
+interval reaches:
+
+| Интервал | Per day | Reached by deadline | |
+| --- | --- | --- | --- |
+| 60 s | ~746 | ~3,300 | 🔴 |
+| 120 s | ~381 | ~1,700 | 🟡 |
+| **180 s** | **~256** | **~1,140** | 🟢 |
+| 300 s | ~155 | ~690 | 🟢 |
+
+The colour is about the account, not the clock: a warmed-up account is
+comfortable around 200–300/day, and limits tend to land above 600/day.
 
 ## Where the state lives
 
-**Postgres.** Nothing that matters is held in memory or on the container disk.
+**Postgres.** Nothing that matters is in memory or on the container disk.
 
 | Table | Holds |
 | --- | --- |
-| `recipients` | The cached dialogue scan — who exists, when you last spoke |
-| `campaigns` | One row per send: the text, the filter, status, pace, stop reason |
-| `deliveries` | **One row per recipient per campaign** — `pending` → `sending` → `sent` / `skipped` / `failed` |
+| `recipients` | Dialogue scan: who, when you last spoke, guessed gender |
+| `campaigns` | Text, filter, status, stop reason |
+| `deliveries` | One row per recipient per campaign: `pending` → `sending` → `sent` / `skipped` / `failed` |
+| `settings` | Deadline, interval, jitter, timezone |
 
-Every delivery is committed the instant it happens. A redeploy, crash, or
-`railway restart` loses **at most the single message in flight**, and even that
-is recovered: anything left `sending` is returned to `pending` on the next boot.
+Every delivery is committed as it happens. A redeploy loses at most the message
+in flight, and that is requeued on the next boot; the panel then offers
+**▶️ Продолжить**. Rows are scoped by `TG_ACCOUNT`.
 
-On startup the bot finds any campaign the database still calls `running`,
-marks it `stopped` honestly, requeues the in-flight row, and messages every
-admin that it restarted. The panel then shows **▶️ Продолжить**, which sends
-only to people who have not yet received it. **Redeploy mid-campaign is safe.**
-
-Rows are scoped by `TG_ACCOUNT`, so several sending accounts can share one
-database without seeing each other's recipients or already-sent guards.
-
-### The other thing that must not be ephemeral
-
-The Telethon session — your account's authorization — normally lives in a
-`.session` file. On Railway that file is wiped by every deploy, and restoring
-it needs a login code that nobody can type inside a container.
-
-So the session is carried in **`TG_SESSION`**, a string you generate once:
-
-```bash
-python -m tgsender session     # log in, prints the string
-```
-
-Put it in Railway's variables. Treat it exactly like a password — it is full
-read and write access to your Telegram account. It is in `.gitignore` and must
-never be committed.
+The Telethon session lives in the `TG_SESSION` variable, because a `.session`
+file on the container disk would be wiped by every deploy. Treat it like a
+password.
 
 ## Deploying
 
-Already provisioned on Railway (project `tg-message-sender-bot`): a `Postgres`
-service and a `bot` service built from the `Dockerfile`, with
-`DATABASE_URL` referencing `${{Postgres.DATABASE_URL}}` over the private
-network.
-
-Variables the `bot` service needs:
+Railway project `tg-message-sender-bot`: `Postgres` plus a `bot` service built
+from the `Dockerfile`, with `DATABASE_URL=${{Postgres.DATABASE_URL}}`.
 
 | Variable | Value |
 | --- | --- |
-| `TG_API_ID`, `TG_API_HASH` | from my.telegram.org |
+| `TG_API_ID`, `TG_API_HASH` | my.telegram.org |
 | `TG_SESSION` | output of `python -m tgsender session` |
-| `BOT_TOKEN` | from @BotFather |
-| `ADMIN_IDS` | numeric ids and/or `@usernames`, comma separated — see below |
+| `BOT_TOKEN` | @BotFather |
+| `ADMIN_IDS` | numeric ids and/or `@usernames`, comma separated |
 | `DATABASE_URL` | `${{Postgres.DATABASE_URL}}` |
-| `TG_ACCOUNT` | `main` |
+| `TG_ACCOUNT` | `main` — one label per Telegram account, never reused |
 
-Deploys happen on push to `main`. There is no HTTP port — this is a worker, so
-Railway showing no domain is correct.
+The GitHub webhook has skipped a push before. After pushing, check the commit
+on the Railway deployment; `railway up --service bot --detach` always works.
 
 ## Who can use the panel
 
-`ADMIN_IDS` takes numeric ids, `@usernames`, or both, mixed:
+`ADMIN_IDS=111111111, @nylinary, some_friend` — ids, usernames, or both. Usernames
+are resolved to ids at startup and logged. Prefer ids: a username can be
+released and claimed by someone else, and this panel sends from your account.
+Anyone else is ignored silently.
 
-```
-ADMIN_IDS=111111111, @nylinary, some_friend
-```
+## Safety rails
 
-The `@` is optional and case is ignored. Get numeric ids from
-[@userinfobot](https://t.me/userinfobot).
+| Signal | Response |
+| --- | --- |
+| `FLOOD_WAIT_X` | Wait X + jitter, slow every later gap ×1.5 (up to ×8), notify admins |
+| `FLOOD_WAIT` > 6 h | Stop — the account is restricted, not throttled |
+| `PEER_FLOOD` | Stop — retrying is what makes a limit permanent |
+| `USER_PRIVACY_RESTRICTED` | Skip that person, continue |
+| Deadline passed | Stop before the next message; the rest stay resumable |
 
-At startup the bot resolves every username to a numeric id through the sending
-account and logs the mapping, so the running filter compares ids, not names.
-If a handle cannot be resolved — the person is not reachable from that account,
-or Telegram is being difficult — the bot logs a warning and falls back to
-matching that one by name, pinning their id the first time they press a button.
-
-**Prefer numeric ids where you have them.** A username can be released and
-re-registered by anyone, and this panel sends from *your* personal account. An
-id is permanent. Usernames are here for convenience, not as the security
-boundary.
-
-Anyone not on the list is ignored silently — no reply, no hint the bot exists.
+Always on: quiet hours 23:00–10:00 in your timezone, and a longer pause every
+60 messages.
 
 ## Running locally
 
 ```bash
 python3 -m venv .venv && .venv/bin/pip install -r requirements.txt
-cp .env.example .env && $EDITOR .env      # needs a DATABASE_URL too
+cp .env.example .env && $EDITOR .env
 .venv/bin/python -m tgsender session      # once, to mint TG_SESSION
 .venv/bin/python -m tgsender run
 ```
 
-Point `DATABASE_URL` at the Railway Postgres public proxy, or any local
-instance. Do not run the local copy and the deployed one against the same
-database at the same time — both would try to send.
-
-## The deadline drives the rate
-
-Set `deadline` in `config.toml`. The panel divides the recipients by the
-sendable time left — wall clock minus quiet hours — and spaces the messages to
-land on it. It re-derives that interval every 25 messages, so a `FLOOD_WAIT` or
-a pause gets absorbed instead of quietly overshooting.
-
-For a 25.09 21:00 deadline there are **63 sendable hours** inside 115 hours of
-wall clock, once nights are excluded:
-
-| Recipients | Interval | Per hour | Per day | |
-| --- | --- | --- | --- | --- |
-| 500 | ~7 min | 8 | 104 | 🟢 |
-| 1,000 | ~3 min | 16 | 209 | 🟢 |
-| 1,500 | ~2 min | 24 | 313 | 🟡 |
-| 2,000 | ~1 min | 32 | 417 | 🟡 |
-| 3,000 | ~1 min | 48 | 626 | 🔴 |
-| 4,000 | ~56 s | 63 | 835 | 🔴 |
-
-**Every one of these fits the deadline.** The colour is not about the clock — it
-is about the account. Empirically a warmed-up account messaging existing
-dialogues is comfortable around 200–300/day; 600+/day is where limits land. The
-panel shows the band and lets you launch anyway.
-
-If you are near the red, the free lever is the **filter**. "Within 1 year" is
-both a smaller number and a warmer audience, and spam reports — not raw
-throughput — are what actually gets accounts limited.
-
-## Safety rails
-
-| Signal | Meaning | Response |
-| --- | --- | --- |
-| `FLOOD_WAIT_X` | Routine throttling | Wait X + jitter, multiply later intervals ×1.5 (capped ×8), notify |
-| `FLOOD_WAIT` > 6h | Account restricted, not throttled | Stop, notify admins |
-| `PEER_FLOOD` | Flagged as a spammer | Stop — retrying is what makes it permanent |
-| `USER_PRIVACY_RESTRICTED` | Their settings block you | Skip, continue |
-| `USER_DEACTIVATED_BAN` | Account banned | Stop |
-
-Always on: quiet hours 23:00–10:00 local, ±35% jitter on every interval, a
-longer pause every 60 messages, and an 8-second floor — below that Telegram
-answers with `FLOOD_WAIT` and you end up slower.
+Never run the local copy and the deployed one at the same time: both would poll
+the same bot token and both would try to send.
 
 ## Tests
 
 ```bash
-.venv/bin/python tests/test_offline.py                    # pure logic, no network
-DATABASE_URL=... .venv/bin/python tests/test_db.py        # Postgres layer
-DATABASE_URL=... .venv/bin/python tests/test_wiring.py    # aiogram wiring
+.venv/bin/python tests/test_offline.py                   # logic, no network
+DATABASE_URL=... .venv/bin/python tests/test_db.py       # Postgres layer
+DATABASE_URL=... .venv/bin/python tests/test_wiring.py   # the panel, end to end
 ```
 
-The two database suites write under throwaway account scopes and clean up
-after themselves; they skip silently without `DATABASE_URL`.
+`test_wiring.py` drives the real dispatcher, admin gate and FSM with a fake
+Telegram and a recording userbot: counting, filters, settings, launching,
+resume, stale buttons, and the deadline stop. The database suites use
+throwaway account scopes and clean up after themselves.
 
 ## Layout
 
 | File | Role |
 | --- | --- |
-| `config.toml` | Deadline, filter options, pacing, risk thresholds |
-| `tgsender/scheduling.py` | Deadline → interval maths, risk bands |
-| `tgsender/bot.py` | The panel: keyboards, compose flow, status |
-| `tgsender/sender.py` | Send loop, error classification, backoff |
-| `tgsender/collect.py` | Dialogue scan |
+| `config.toml` | Defaults for settings, quiet hours, risk thresholds |
+| `tgsender/bot.py` | The panel |
+| `tgsender/filters.py` | Period presets and parsing; the `Filter` object |
+| `tgsender/gender.py` | Gender guess from display names |
+| `tgsender/settings.py` | Runtime settings and their parsing |
+| `tgsender/scheduling.py` | Pace, finish time and deadline arithmetic |
+| `tgsender/sender.py` | Send loop, error handling, backoff, deadline stop |
 | `tgsender/db.py` | Postgres schema and every state transition |
-| `Dockerfile`, `railway.json` | Deploy |
-
-## Notes
-
-- **One campaign at a time.** The panel refuses to start a second.
-- **Nobody is invited twice.** A new campaign excludes anyone who received an
-  earlier one and says how many it excluded. `exclude_sent=False` on
-  `create_campaign` overrides it if you ever want a genuine re-send.
-- **Text only.** Photos and files are rejected at compose time. Formatting
-  survives; the bot verifies Telethon can parse the markup before accepting it
-  rather than discovering it mid-campaign.
-- **The panel is shared, the account is not.** Any whitelisted friend can start
-  a campaign, and it sends from *your* account.
-- Panel strings are Russian, inline in `tgsender/bot.py`.

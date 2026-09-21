@@ -6,6 +6,10 @@ from typing import Any
 
 import asyncpg
 
+from .filters import Filter
+from .gender import UNKNOWN
+from .gender import guess as guess_gender
+
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS recipients (
     account         TEXT   NOT NULL,
@@ -20,6 +24,7 @@ CREATE TABLE IF NOT EXISTS recipients (
 );
 CREATE INDEX IF NOT EXISTS idx_recipients_last
     ON recipients(account, last_message_at);
+ALTER TABLE recipients ADD COLUMN IF NOT EXISTS gender TEXT;
 
 CREATE TABLE IF NOT EXISTS campaigns (
     id          BIGSERIAL PRIMARY KEY,
@@ -37,6 +42,7 @@ CREATE TABLE IF NOT EXISTS campaigns (
 );
 CREATE INDEX IF NOT EXISTS idx_campaigns_account
     ON campaigns(account, status, id DESC);
+ALTER TABLE campaigns ADD COLUMN IF NOT EXISTS filter_json TEXT;
 
 CREATE TABLE IF NOT EXISTS deliveries (
     campaign_id BIGINT NOT NULL REFERENCES campaigns(id) ON DELETE CASCADE,
@@ -50,10 +56,18 @@ CREATE INDEX IF NOT EXISTS idx_deliveries_queue
     ON deliveries(campaign_id, status);
 CREATE INDEX IF NOT EXISTS idx_deliveries_sent
     ON deliveries(campaign_id, sent_at);
+
+CREATE TABLE IF NOT EXISTS settings (
+    account    TEXT NOT NULL,
+    key        TEXT NOT NULL,
+    value      TEXT NOT NULL,
+    updated_at DOUBLE PRECISION NOT NULL,
+    updated_by BIGINT,
+    PRIMARY KEY (account, key)
+);
 """
 
 ACTIVE_STATUSES = ("running", "paused")
-YEAR_SECONDS = 365.25 * 86400
 
 
 @dataclass
@@ -64,6 +78,7 @@ class Recipient:
     first_name: str | None
     last_name: str | None
     last_message_at: float | None
+    gender: str | None = None
 
     @property
     def label(self) -> str:
@@ -81,6 +96,7 @@ def _row_to_recipient(row: asyncpg.Record) -> Recipient:
         first_name=row["first_name"],
         last_name=row["last_name"],
         last_message_at=row["last_message_at"],
+        gender=row["gender"],
     )
 
 
@@ -119,15 +135,16 @@ class DB:
             """
             INSERT INTO recipients
                 (account, user_id, access_hash, username, first_name, last_name,
-                 last_message_at, collected_at)
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+                 last_message_at, collected_at, gender)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
             ON CONFLICT (account, user_id) DO UPDATE SET
                 access_hash     = EXCLUDED.access_hash,
                 username        = EXCLUDED.username,
                 first_name      = EXCLUDED.first_name,
                 last_name       = EXCLUDED.last_name,
                 last_message_at = EXCLUDED.last_message_at,
-                collected_at    = EXCLUDED.collected_at
+                collected_at    = EXCLUDED.collected_at,
+                gender          = EXCLUDED.gender
             """,
             [
                 (
@@ -139,10 +156,32 @@ class DB:
                     r.last_name,
                     r.last_message_at,
                     now,
+                    r.gender or guess_gender(r.first_name, r.last_name),
                 )
                 for r in batch
             ],
         )
+
+    async def backfill_gender(self, *, force: bool = False) -> int:
+        """Guess gender for rows collected before the column existed.
+
+        `force` recomputes everything, for after the name lists improve.
+        """
+        rows = await self.pool.fetch(
+            "SELECT user_id, first_name, last_name FROM recipients "
+            "WHERE account = $1" + ("" if force else " AND gender IS NULL"),
+            self.account,
+        )
+        if not rows:
+            return 0
+        await self.pool.executemany(
+            "UPDATE recipients SET gender = $3 WHERE account = $1 AND user_id = $2",
+            [
+                (self.account, r["user_id"], guess_gender(r["first_name"], r["last_name"]))
+                for r in rows
+            ],
+        )
+        return len(rows)
 
     async def recipients_total(self) -> int:
         return await self.pool.fetchval(
@@ -155,53 +194,110 @@ class DB:
         )
 
     def _selector(
-        self, max_age_years: float | None, exclude_sent: bool, start: int = 1
+        self,
+        flt: Filter,
+        exclude_sent: bool,
+        start: int = 1,
+        *,
+        ignore_gender: bool = False,
     ) -> tuple[str, list[Any]]:
-        """WHERE clause picking recipients for a filter.
+        """WHERE clause for a filter.
 
-        Shared by the count and the insert so the number the panel promises is
-        exactly the number that gets queued.
+        Shared by the counts and the campaign insert, so the number the panel
+        promises is exactly the number that gets queued.
         """
         params: list[Any] = [self.account]
         clauses = [f"r.account = ${start}"]
         n = start
 
-        if max_age_years is not None:
+        def arg(value: Any) -> str:
+            nonlocal n
             n += 1
-            clauses.append(
-                f"r.last_message_at IS NOT NULL AND r.last_message_at >= ${n}"
-            )
-            params.append(time.time() - max_age_years * YEAR_SECONDS)
+            params.append(value)
+            return f"${n}"
 
+        if flt.dated:
+            # A date bound can only be checked against a known date.
+            clauses.append("r.last_message_at IS NOT NULL")
+        if flt.since_ts is not None:
+            clauses.append(f"r.last_message_at >= {arg(flt.since_ts)}")
+        if flt.until_ts is not None:
+            clauses.append(f"r.last_message_at <= {arg(flt.until_ts)}")
+        if not ignore_gender and not flt.all_genders:
+            clauses.append(
+                f"COALESCE(r.gender, '{UNKNOWN}') = ANY({arg(sorted(flt.genders))}::text[])"
+            )
         if exclude_sent:
             # Nobody gets the invite twice because a run was restarted.
-            n += 1
             clauses.append(
                 f"""NOT EXISTS (
                     SELECT 1 FROM deliveries d
                     JOIN campaigns c ON c.id = d.campaign_id
                     WHERE d.user_id = r.user_id
                       AND d.status = 'sent'
-                      AND c.account = ${n}
+                      AND c.account = {arg(self.account)}
                 )"""
             )
-            params.append(self.account)
-
         return " WHERE " + " AND ".join(clauses), params
 
-    async def count_by_age(
-        self, max_age_years: float | None, exclude_sent: bool = True
-    ) -> int:
-        where, params = self._selector(max_age_years, exclude_sent)
+    async def count(self, flt: Filter, exclude_sent: bool = True) -> int:
+        where, params = self._selector(flt, exclude_sent)
         return await self.pool.fetchval(
             f"SELECT COUNT(*) FROM recipients r{where}", *params
         )
 
-    async def already_sent_in_range(self, max_age_years: float | None) -> int:
+    async def breakdown(self, flt: Filter) -> dict[str, int]:
+        """Not-yet-invited people in the filter's period, by gender.
+
+        The gender selection is ignored here on purpose: the panel shows all
+        three numbers so you can see what each toggle would add or remove.
+        """
+        where, params = self._selector(flt, exclude_sent=True, ignore_gender=True)
+        rows = await self.pool.fetch(
+            f"SELECT COALESCE(r.gender, '{UNKNOWN}') AS g, COUNT(*) AS n "
+            f"FROM recipients r{where} GROUP BY g",
+            *params,
+        )
+        return {r["g"]: r["n"] for r in rows}
+
+    async def already_sent_in_range(self, flt: Filter) -> int:
         """How many under this filter already received an earlier campaign."""
-        total = await self.count_by_age(max_age_years, exclude_sent=False)
-        fresh = await self.count_by_age(max_age_years, exclude_sent=True)
-        return total - fresh
+        return await self.count(flt, exclude_sent=False) - await self.count(flt)
+
+    async def sample(self, flt: Filter, limit: int = 25) -> list[Recipient]:
+        where, params = self._selector(flt, exclude_sent=True)
+        rows = await self.pool.fetch(
+            f"SELECT r.* FROM recipients r{where} ORDER BY random() LIMIT {int(limit)}",
+            *params,
+        )
+        return [_row_to_recipient(r) for r in rows]
+
+    # ------------------------------------------------------------------ #
+    # settings
+    # ------------------------------------------------------------------ #
+
+    async def get_settings(self) -> dict[str, str]:
+        rows = await self.pool.fetch(
+            "SELECT key, value FROM settings WHERE account = $1", self.account
+        )
+        return {r["key"]: r["value"] for r in rows}
+
+    async def set_setting(self, key: str, value: str, by: int | None = None) -> None:
+        await self.pool.execute(
+            """
+            INSERT INTO settings (account, key, value, updated_at, updated_by)
+            VALUES ($1, $2, $3, $4, $5)
+            ON CONFLICT (account, key) DO UPDATE SET
+                value = EXCLUDED.value,
+                updated_at = EXCLUDED.updated_at,
+                updated_by = EXCLUDED.updated_by
+            """,
+            self.account,
+            key,
+            value,
+            time.time(),
+            by,
+        )
 
     # ------------------------------------------------------------------ #
     # campaigns
@@ -219,6 +315,12 @@ class DB:
         return await self.pool.fetchrow(
             "SELECT * FROM campaigns WHERE id = $1 AND account = $2",
             campaign_id,
+            self.account,
+        )
+
+    async def latest_campaign(self) -> asyncpg.Record | None:
+        return await self.pool.fetchrow(
+            "SELECT * FROM campaigns WHERE account = $1 ORDER BY id DESC LIMIT 1",
             self.account,
         )
 
@@ -241,9 +343,9 @@ class DB:
         self,
         body: str,
         parse_mode: str | None,
-        max_age_years: float | None,
+        flt: Filter,
         created_by: int,
-        delay: float,
+        interval: float,
         exclude_sent: bool = True,
     ) -> int:
         """Create a campaign and freeze its recipient list in one transaction."""
@@ -251,7 +353,7 @@ class DB:
             campaign_id = await conn.fetchval(
                 """
                 INSERT INTO campaigns
-                    (account, body, parse_mode, max_age_yrs, status, created_by,
+                    (account, body, parse_mode, filter_json, status, created_by,
                      created_at, started_at, delay)
                 VALUES ($1, $2, $3, $4, 'running', $5, $6, $6, $7)
                 RETURNING id
@@ -259,12 +361,12 @@ class DB:
                 self.account,
                 body,
                 parse_mode,
-                max_age_years,
+                flt.to_json(),
                 created_by,
                 time.time(),
-                delay,
+                interval,
             )
-            where, params = self._selector(max_age_years, exclude_sent, start=2)
+            where, params = self._selector(flt, exclude_sent, start=2)
             await conn.execute(
                 f"""
                 INSERT INTO deliveries (campaign_id, user_id, status)
@@ -287,17 +389,12 @@ class DB:
             campaign_id,
         )
 
-    async def reopen_campaign(self, campaign_id: int, delay: float) -> None:
+    async def reopen_campaign(self, campaign_id: int, interval: float) -> None:
         await self.pool.execute(
             "UPDATE campaigns SET status = 'running', finished_at = NULL, "
             "stop_reason = NULL, delay = $1 WHERE id = $2",
-            delay,
+            interval,
             campaign_id,
-        )
-
-    async def set_campaign_delay(self, campaign_id: int, delay: float) -> None:
-        await self.pool.execute(
-            "UPDATE campaigns SET delay = $1 WHERE id = $2", delay, campaign_id
         )
 
     # ------------------------------------------------------------------ #

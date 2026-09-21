@@ -1,19 +1,23 @@
+"""When will a campaign finish at the chosen pace, and does that beat the deadline?
+
+The interval is set by the user (⚙️ Настройки). This module works out what that
+means: messages per hour and per day, the finish time once nights are skipped,
+whether that lands before the deadline, and — if not — how many people the
+campaign will actually reach before sending stops.
+
+All datetimes here are timezone-aware and in the user's timezone, because quiet
+hours are local hours.
+"""
+
 from __future__ import annotations
 
-import math
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 
 from .config import Pacing, Risk
 
-GREEN, YELLOW, RED, IMPOSSIBLE = "green", "yellow", "red", "impossible"
-
-BADGE = {
-    GREEN: "🟢",
-    YELLOW: "🟡",
-    RED: "🔴",
-    IMPOSSIBLE: "⛔️",
-}
+GREEN, YELLOW, RED = "green", "yellow", "red"
+BADGE = {GREEN: "🟢", YELLOW: "🟡", RED: "🔴"}
 
 
 def is_quiet(hour: int, start: int, end: int) -> bool:
@@ -25,107 +29,119 @@ def is_quiet(hour: int, start: int, end: int) -> bool:
     return start <= hour < end
 
 
+def quiet_hours_per_day(start: int, end: int) -> int:
+    if start == end:
+        return 0
+    return (24 - start + end) if start > end else (end - start)
+
+
+def _chunks(start: datetime, stop: datetime):
+    """Walk [start, stop) in pieces that never cross an hour boundary."""
+    cursor = start
+    while cursor < stop:
+        next_hour = cursor.replace(minute=0, second=0, microsecond=0) + timedelta(hours=1)
+        chunk_end = min(next_hour, stop)
+        yield cursor, chunk_end
+        cursor = chunk_end
+
+
 def active_seconds(now: datetime, deadline: datetime, start: int, end: int) -> float:
     """Sendable seconds between two moments, excluding quiet hours."""
     if deadline <= now:
         return 0.0
+    return sum(
+        (b - a).total_seconds()
+        for a, b in _chunks(now, deadline)
+        if not is_quiet(a.hour, start, end)
+    )
 
-    total = 0.0
-    cursor = now
-    while cursor < deadline:
-        next_hour = cursor.replace(minute=0, second=0, microsecond=0) + timedelta(hours=1)
-        chunk_end = min(next_hour, deadline)
-        if not is_quiet(cursor.hour, start, end):
-            total += (chunk_end - cursor).total_seconds()
-        cursor = chunk_end
-    return total
+
+def advance(now: datetime, seconds: float, start: int, end: int) -> datetime:
+    """The moment `seconds` of sending time have elapsed, skipping quiet hours."""
+    remaining = seconds
+    horizon = now + timedelta(days=3650)
+    for a, b in _chunks(now, horizon):
+        if is_quiet(a.hour, start, end):
+            continue
+        span = (b - a).total_seconds()
+        if remaining <= span:
+            return a + timedelta(seconds=remaining)
+        remaining -= span
+    return horizon
 
 
 @dataclass(frozen=True)
-class Plan:
+class Estimate:
     recipients: int
+    interval: float
+    jitter: float
     now: datetime
     deadline: datetime
     seconds_available: float
-    delay: float          # mean gap between messages, seconds
-    per_hour: float       # while actually sending
-    per_day: float        # spread over calendar days remaining
+    seconds_needed: float
+    finishes_at: datetime
+    capacity: int          # how many get it before the deadline stops sending
+    per_hour: float
+    per_day: float
     risk: str
-    at_floor: bool        # True when the deadline demands faster than min_delay
 
     @property
-    def days_left(self) -> float:
-        return max(0.0, (self.deadline - self.now).total_seconds() / 86400)
+    def fits(self) -> bool:
+        return self.capacity >= self.recipients
 
     @property
-    def finishes_at(self) -> datetime:
-        return self.now + timedelta(seconds=self.delay * max(0, self.recipients - 1))
-
-    @property
-    def feasible(self) -> bool:
-        return self.risk != IMPOSSIBLE
+    def missed(self) -> int:
+        return max(0, self.recipients - self.capacity)
 
 
-def build_plan(
+def estimate(
     recipients: int,
+    interval: float,
+    jitter: float,
     deadline: datetime,
     pacing: Pacing,
     risk_cfg: Risk,
-    now: datetime | None = None,
-) -> Plan:
-    """Work out the gap between messages needed to finish by the deadline."""
-    now = now or datetime.now()
-    available = active_seconds(now, deadline, pacing.quiet_start, pacing.quiet_end)
+    now: datetime,
+) -> Estimate:
+    qs, qe = pacing.quiet_start, pacing.quiet_end
+    # Jitter is symmetric, so on average it cancels; the long breaks do not.
+    long_break = (pacing.long_pause_min + pacing.long_pause_max) / 2
+    per_message = interval + long_break / max(1, pacing.long_pause_every)
 
-    if recipients <= 0:
-        return Plan(0, now, deadline, available, pacing.min_delay, 0, 0, GREEN, False)
+    gaps = max(0, recipients - 1)
+    needed = gaps * interval + (gaps // max(1, pacing.long_pause_every)) * long_break
+    available = active_seconds(now, deadline, qs, qe)
 
-    # n messages need n-1 gaps. With a single recipient there is no gap to
-    # stretch, so the window is irrelevant and the floor applies.
-    if recipients == 1:
-        band = GREEN if available > 0 else IMPOSSIBLE
-        return Plan(
-            recipients=1,
-            now=now,
-            deadline=deadline,
-            seconds_available=available,
-            delay=pacing.min_delay,
-            per_hour=3600 / pacing.min_delay,
-            per_day=1,
-            risk=band,
-            at_floor=False,
-        )
+    if recipients <= 0 or available <= 0:
+        capacity = 0 if available <= 0 else recipients
+    else:
+        # The first message goes out at once; each further one costs a gap.
+        capacity = min(recipients, 1 + int(available // per_message))
 
-    gaps = recipients - 1
-    ideal = available / gaps if available > 0 else 0.0
+    per_hour = 3600 / interval
+    sendable_hours = 24 - quiet_hours_per_day(qs, qe)
+    per_day = sendable_hours * 3600 / per_message
 
-    at_floor = ideal < pacing.min_delay
-    delay = max(pacing.min_delay, ideal)
-
-    per_hour = 3600 / delay
-    days = max(available / 86400, (deadline - now).total_seconds() / 86400)
-    per_day = recipients / days if days > 0 else float("inf")
-
-    if available <= 0 or at_floor:
-        # Even flat out we cannot make the deadline.
-        band = IMPOSSIBLE
-    elif per_day >= risk_cfg.danger_per_day:
+    if per_day >= risk_cfg.danger_per_day:
         band = RED
     elif per_day >= risk_cfg.warn_per_day:
         band = YELLOW
     else:
         band = GREEN
 
-    return Plan(
+    return Estimate(
         recipients=recipients,
+        interval=interval,
+        jitter=jitter,
         now=now,
         deadline=deadline,
         seconds_available=available,
-        delay=delay,
+        seconds_needed=needed,
+        finishes_at=advance(now, needed, qs, qe),
+        capacity=capacity,
         per_hour=per_hour,
         per_day=per_day,
         risk=band,
-        at_floor=at_floor,
     )
 
 
@@ -134,62 +150,74 @@ def humanize(seconds: float) -> str:
     if seconds < 60:
         return f"{seconds} с"
     if seconds < 3600:
-        return f"{seconds // 60} мин"
+        m, s = divmod(seconds, 60)
+        return f"{m} мин" + (f" {s} с" if s else "")
     if seconds < 86400:
         return f"{seconds // 3600} ч {(seconds % 3600) // 60:02d} мин"
     return f"{seconds // 86400} д {(seconds % 86400) // 3600} ч"
 
 
-def describe(plan: Plan, risk_cfg: Risk) -> str:
-    """The block of text the panel shows before you press Send."""
+def describe(est: Estimate, pacing: Pacing, risk_cfg: Risk, timezone: str) -> str:
+    """The pace and deadline block shown before launching."""
+    lo, hi = est.interval * (1 - est.jitter), est.interval * (1 + est.jitter)
     lines = [
-        f"👥 Получателей: <b>{plan.recipients}</b>",
-        f"⏳ До дедлайна: <b>{humanize((plan.deadline - plan.now).total_seconds())}</b>"
-        f" (до {plan.deadline:%d.%m %H:%M})",
-        f"🕐 Рабочего времени: <b>{humanize(plan.seconds_available)}</b>"
-        f" <i>(без ночных часов)</i>",
+        f"👥 Получателей: <b>{est.recipients}</b>",
+        f"⏱ Интервал: <b>{humanize(est.interval)}</b>"
+        + (f" ±{est.jitter * 100:.0f}% <i>({humanize(lo)}–{humanize(hi)})</i>"
+           if est.jitter else ""),
+        f"📈 Темп: ~<b>{est.per_hour:.0f}/час</b>, ~<b>{est.per_day:.0f}/сутки</b>",
+        f"🌙 Ночью не шлём: {pacing.quiet_start:02d}:00–{pacing.quiet_end:02d}:00 "
+        f"<i>({timezone})</i>",
+        f"🏁 Дедлайн: <b>{est.deadline:%d.%m %H:%M}</b>",
     ]
-
-    if plan.recipients == 0:
+    if est.recipients == 0:
         lines.append("\nПод фильтр никто не попал.")
         return "\n".join(lines)
 
-    lines += [
-        "",
-        f"📨 Интервал: <b>~{humanize(plan.delay)}</b> между сообщениями",
-        f"📈 Темп: <b>~{plan.per_hour:.0f}/час</b>, <b>~{plan.per_day:.0f}/сутки</b>",
-    ]
+    if est.seconds_available <= 0:
+        lines += ["", "⛔️ <b>Дедлайн уже прошёл.</b> Поменяй его в ⚙️ Настройках."]
+    elif est.fits:
+        lines.append(f"✅ Успеваем: закончим ~<b>{est.finishes_at:%d.%m %H:%M}</b>")
+    else:
+        lines += [
+            "",
+            f"⛔️ <b>Не успеваем.</b> До дедлайна уйдёт ~<b>{est.capacity}</b> из "
+            f"<b>{est.recipients}</b>, остальным ~{est.missed} — нет: в дедлайн "
+            f"рассылка остановится.",
+        ]
+        needed = _interval_to_fit(est, pacing)
+        if needed >= pacing.min_interval:
+            lines.append(
+                f"Чтобы успеть всем, нужен интервал ~<b>{humanize(needed)}</b> — "
+                f"или сузь фильтр, или сдвинь дедлайн."
+            )
+        else:
+            lines.append(
+                "Даже на минимальном интервале всем не успеть — сузь фильтр "
+                "или сдвинь дедлайн."
+            )
 
-    badge = BADGE[plan.risk]
-    if plan.risk == IMPOSSIBLE:
-        overflow = math.ceil(plan.recipients - plan.seconds_available / plan.delay) - 1
+    badge = BADGE[est.risk]
+    if est.risk == RED:
         lines += [
             "",
-            f"{badge} <b>В дедлайн не укладываемся.</b>",
-            f"На максимальной скорости ({humanize(plan.delay)}/сообщение) успеем "
-            f"отправить примерно <b>{int(plan.seconds_available / plan.delay)}</b> из "
-            f"<b>{plan.recipients}</b> — не хватит на ~<b>{max(0, overflow)}</b>.",
-            "",
-            "Варианты: сузить фильтр, сдвинуть дедлайн в config.toml, "
-            "или разослать остальным ссылку-приглашение через публичный бот.",
+            f"{badge} <b>Очень высокий темп</b> — выше {risk_cfg.danger_per_day}/сутки, "
+            f"где аккаунты обычно получают ограничения. При PEER_FLOOD рассылка "
+            f"остановится сама.",
         ]
-    elif plan.risk == RED:
+    elif est.risk == YELLOW:
         lines += [
             "",
-            f"{badge} <b>Очень высокий темп.</b> {plan.per_day:.0f}/сутки — это выше "
-            f"порога {risk_cfg.danger_per_day}/сутки, при котором аккаунты обычно "
-            f"получают ограничение.",
-            "Рассылка запустится, если подтвердишь. Следи за статусом: при PEER_FLOOD "
-            "она остановится сама.",
-        ]
-    elif plan.risk == YELLOW:
-        lines += [
-            "",
-            f"{badge} <b>Темп выше спокойного.</b> {plan.per_day:.0f}/сутки при "
-            f"ориентире {risk_cfg.warn_per_day}/сутки. Рискованно, но обычно проходит "
-            f"на прогретом аккаунте.",
+            f"{badge} Темп выше спокойного ({risk_cfg.warn_per_day}/сутки). "
+            f"Обычно проходит на прогретом аккаунте.",
         ]
     else:
-        lines += ["", f"{badge} Темп в безопасном диапазоне."]
-
+        lines.append(f"{badge} Темп спокойный.")
     return "\n".join(lines)
+
+
+def _interval_to_fit(est: Estimate, pacing: Pacing) -> float:
+    gaps = max(1, est.recipients - 1)
+    long_break = (pacing.long_pause_min + pacing.long_pause_max) / 2
+    breaks = (gaps // max(1, pacing.long_pause_every)) * long_break
+    return max(0.0, (est.seconds_available - breaks) / gaps)

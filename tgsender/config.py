@@ -15,10 +15,11 @@ load_dotenv(ROOT / ".env")
 
 @dataclass(frozen=True)
 class Pacing:
+    interval: float
+    jitter: float
+    min_interval: float
     quiet_start: int
     quiet_end: int
-    min_delay: float
-    jitter: float
     long_pause_every: int
     long_pause_min: float
     long_pause_max: float
@@ -40,8 +41,8 @@ class Config:
     admin_ids: frozenset[int]
     admin_usernames: frozenset[str]
     account: str
-    deadline: datetime
-    age_options: tuple[int, ...]
+    deadline: datetime      # naive, local to `timezone`
+    timezone: str
     pacing: Pacing
     risk: Risk
     stale_after_hours: float
@@ -155,8 +156,8 @@ def load(config_path: Path | None = None) -> Config:
         admin_ids=admin_ids,
         admin_usernames=admin_usernames,
         account=account,
-        deadline=datetime.fromisoformat(raw["campaign"]["deadline"]),
-        age_options=tuple(raw["campaign"]["age_options"]),
+        deadline=datetime.fromisoformat(raw["campaign"]["deadline"]).replace(tzinfo=None),
+        timezone=raw["campaign"].get("timezone", "Europe/Moscow"),
         pacing=Pacing(**raw["pacing"]),
         risk=Risk(**raw["risk"]),
         stale_after_hours=float(raw["collect"]["stale_after_hours"]),

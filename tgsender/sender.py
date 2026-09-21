@@ -3,14 +3,15 @@ from __future__ import annotations
 import asyncio
 import random
 import time
-from datetime import datetime, timedelta
+from datetime import timedelta
 
 from telethon import TelegramClient, errors
 from telethon.tl.types import InputPeerUser
 
+from . import settings as settings_mod
 from .config import Config
 from .db import DB
-from .scheduling import build_plan, is_quiet
+from .scheduling import is_quiet
 
 # The recipient is unreachable and always will be — skip, keep going.
 PERMANENT_ERRORS = (
@@ -31,7 +32,6 @@ ACCOUNT_ERRORS = (
     errors.SessionExpiredError,
 )
 
-REPLAN_EVERY = 25
 MAX_FLOOD_WAIT = 6 * 3600
 
 
@@ -96,31 +96,44 @@ class SendWorker:
         campaign = await self.db.get_campaign(campaign_id)
         text = campaign["body"]
         parse_mode = campaign["parse_mode"]
-        delay = campaign["delay"]
         sent_in_run = 0
         recipient = None
+        stopped = "Остановлено вручную"
 
         try:
             while True:
                 if self._stop.is_set():
-                    return await self._finish(campaign_id, "stopped", "Остановлено вручную")
+                    return await self._finish(campaign_id, "stopped", stopped)
+
+                # Settings are re-read every message, so changing the interval,
+                # jitter, timezone or deadline in the panel applies right away.
+                s = await settings_mod.load(self.db, self.cfg)
+                if s.now() >= s.deadline:
+                    return await self._deadline_reached(campaign_id, s)
 
                 # Pace first, claim second: a claimed recipient is marked
                 # in-flight, and holding one across a long sleep would strand
                 # them if the process died mid-wait.
-                if not await self._wait_out_quiet_hours():
-                    return await self._finish(campaign_id, "stopped", "Остановлено вручную")
+                if not await self._wait_out_quiet_hours(s):
+                    return await self._finish(campaign_id, "stopped", stopped)
 
                 if sent_in_run and sent_in_run % p.long_pause_every == 0:
                     pause = random.uniform(p.long_pause_min, p.long_pause_max)
                     if not await self._sleep(pause, "длинная пауза"):
-                        return await self._finish(campaign_id, "stopped", "Остановлено вручную")
+                        return await self._finish(campaign_id, "stopped", stopped)
 
                 if sent_in_run:
-                    gap = delay * self.multiplier
-                    gap *= random.uniform(1 - p.jitter, 1 + p.jitter)
+                    gap = s.interval * self.multiplier
+                    gap *= random.uniform(1 - s.jitter, 1 + s.jitter)
                     if not await self._sleep(gap, "интервал"):
-                        return await self._finish(campaign_id, "stopped", "Остановлено вручную")
+                        return await self._finish(campaign_id, "stopped", stopped)
+
+                # The wait may have carried us past the deadline or into the night.
+                s = await settings_mod.load(self.db, self.cfg)
+                if s.now() >= s.deadline:
+                    return await self._deadline_reached(campaign_id, s)
+                if is_quiet(s.now().hour, p.quiet_start, p.quiet_end):
+                    continue
 
                 recipient = await self.db.claim_next(campaign_id)
                 if recipient is None:
@@ -134,16 +147,6 @@ class SendWorker:
                     sent_in_run += 1
                     self.multiplier = max(1.0, self.multiplier * 0.97)
 
-                # Re-derive the pace from what is actually left, so FLOOD_WAITs
-                # and manual pauses get absorbed instead of silently blowing
-                # through the deadline.
-                if sent_in_run and sent_in_run % REPLAN_EVERY == 0:
-                    remaining = (await self.db.progress(campaign_id)).get("pending", 0)
-                    delay = build_plan(
-                        remaining, self.cfg.deadline, p, self.cfg.risk
-                    ).delay
-                    await self.db.set_campaign_delay(campaign_id, delay)
-
         except asyncio.CancelledError:
             if recipient is not None:
                 await self.db.mark(campaign_id, recipient.user_id, "pending")
@@ -153,6 +156,16 @@ class SendWorker:
             if recipient is not None:
                 await self.db.mark(campaign_id, recipient.user_id, "pending")
             await self._finish(campaign_id, "failed", f"{type(exc).__name__}: {exc}")
+
+    async def _deadline_reached(self, campaign_id: int, s) -> None:
+        left = (await self.db.progress(campaign_id)).get("pending", 0)
+        await self._finish(
+            campaign_id,
+            "stopped",
+            f"Дедлайн {s.deadline:%d.%m %H:%M} наступил — рассылка остановлена. "
+            f"Не отправлено: {left}. Если нужно дослать, сдвинь дедлайн в "
+            f"⚙️ Настройках и нажми «Продолжить».",
+        )
 
     async def _send_one(self, campaign_id, recipient, text, parse_mode) -> str:
         peer = (
@@ -210,10 +223,10 @@ class SendWorker:
         await self.db.mark(campaign_id, recipient.user_id, "sent")
         return "sent"
 
-    async def _wait_out_quiet_hours(self) -> bool:
+    async def _wait_out_quiet_hours(self, s) -> bool:
         p = self.cfg.pacing
         while True:
-            now = datetime.now()
+            now = s.now()
             if not is_quiet(now.hour, p.quiet_start, p.quiet_end):
                 return True
             resume = now.replace(hour=p.quiet_end, minute=0, second=0, microsecond=0)
@@ -240,13 +253,16 @@ class SendWorker:
         counts = await self.db.progress(self.campaign_id)
         campaign = await self.db.get_campaign(self.campaign_id)
         last_hour = await self.db.sent_since(self.campaign_id, time.time() - 3600)
+        s = await settings_mod.load(self.db, self.cfg)
         return {
             "running": self.running,
             "campaign_id": self.campaign_id,
             "status": campaign["status"] if campaign else "unknown",
             "stop_reason": campaign["stop_reason"] if campaign else None,
             "counts": counts,
-            "delay": campaign["delay"] if campaign else None,
+            "interval": s.interval,
+            "jitter": s.jitter,
+            "filter_json": campaign["filter_json"] if campaign else None,
             "multiplier": self.multiplier,
             "last_hour": last_hour,
             "waiting_for": (

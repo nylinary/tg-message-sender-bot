@@ -1,36 +1,33 @@
-[campaign]
-# Everything must be delivered by this moment (local time). The bot divides the
-# recipient count by the time left to work out the gap between messages.
-deadline = "2026-09-25T21:00:00"
+# Defaults only. The deadline, interval, jitter and timezone can all be changed
+# from the bot (⚙️ Настройки); values set there are stored in Postgres and win.
 
-# Years offered as "last dialogue no older than N years" buttons in the panel.
-age_options = [1, 2, 3]
+[campaign]
+# Local wall-clock time in `timezone`. After it passes, sending stops.
+deadline = "2026-09-25T21:00:00"
+timezone = "Europe/Moscow"
 
 [pacing]
-# Don't send between these local hours. Night sends annoy people, and annoyed
-# people press "Report spam", which is what actually gets accounts limited.
+# Seconds between two messages, and how much each gap is randomised (±35%).
+interval     = 180
+jitter       = 0.35
+# Nobody can set the interval below this; Telegram answers FLOOD_WAIT anyway.
+min_interval = 10
+
+# No sending between these hours, local to `timezone`.
 quiet_start = 23
 quiet_end   = 10
 
-# Hard floor on the gap between two messages, in seconds. Not a policy cap —
-# below this Telegram simply answers with FLOOD_WAIT and you go slower overall.
-min_delay = 8.0
-
-# Randomise each gap by +/- this fraction so the cadence isn't machine-flat.
-jitter = 0.35
-
-# Pause for a while after every N messages.
+# An extra pause after every N messages.
 long_pause_every = 60
 long_pause_min   = 90
 long_pause_max   = 240
 
-# Multiply all later gaps by this after each FLOOD_WAIT, up to the cap.
+# Multiply later gaps by this after each FLOOD_WAIT, up to the cap.
 flood_backoff     = 1.5
 flood_backoff_max = 8.0
 
 [risk]
-# Messages per day above which the panel shows a warning. Advisory only —
-# the deadline still drives the actual rate.
+# Messages per day above which the panel warns. Advisory only.
 warn_per_day   = 300
 danger_per_day = 600
 

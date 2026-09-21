@@ -12,6 +12,7 @@ from telethon import TelegramClient
 from telethon.sessions import StringSession
 
 from . import config as config_mod
+from . import settings as settings_mod
 from .bot import AdminGate, Panel, router
 from .db import DB
 from .sender import SendWorker
@@ -133,6 +134,18 @@ async def cmd_session(cfg: config_mod.Config) -> int:
 async def cmd_run(cfg: config_mod.Config) -> int:
     db = await DB.connect(config_mod.require_database_url(cfg), cfg.account)
     log.info("Postgres connected; account scope %r", cfg.account)
+    guessed = await db.backfill_gender()
+    if guessed:
+        log.info("Guessed gender for %s recipients collected earlier", guessed)
+    s = await settings_mod.load(db, cfg)
+    log.info(
+        "Settings: deadline %s, interval %ss ±%d%%, timezone %s (local now %s)",
+        s.deadline.strftime("%d.%m.%Y %H:%M"),
+        f"{s.interval:g}",
+        round(s.jitter * 100),
+        s.timezone,
+        s.now().strftime("%H:%M"),
+    )
 
     client = await _connect_userbot(cfg)
 
@@ -203,6 +216,16 @@ async def cmd_run(cfg: config_mod.Config) -> int:
 
     dp = Dispatcher()
     dp.include_router(router)
+
+    @dp.update.outer_middleware()
+    async def log_unrouted(handler, update, data):
+        # The router only listens to messages and button presses. Anything
+        # else (someone blocking the bot, an edited message) is named here
+        # instead of surfacing as a bare "Update is not handled".
+        kind = update.event_type
+        if kind not in ("message", "callback_query"):
+            log.info("Update %s of type %r is not used by this bot", update.update_id, kind)
+        return await handler(update, data)
 
     try:
         await dp.start_polling(bot, panel=panel, handle_signals=False)

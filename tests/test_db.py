@@ -21,16 +21,22 @@ if not DSN:
 
 from tgsender.config import normalize_dsn  # noqa: E402
 from tgsender.db import DB, Recipient  # noqa: E402
+from tgsender.filters import DAY, Filter  # noqa: E402
 
 ok = lambda m: print(f"  ok  {m}")
-YEAR = 365.25 * 86400
+YEAR = 365.25 * DAY
 TAG = uuid.uuid4().hex[:8]
 ACCOUNT = f"test_{TAG}"
 OTHER = f"other_{TAG}"
 
 
-def person(uid: int, years_ago: float) -> Recipient:
-    return Recipient(uid, uid * 10, f"u{uid}", f"N{uid}", None, time.time() - years_ago * YEAR)
+def person(uid, years_ago, first=None, last=None):
+    return Recipient(uid, uid * 10, f"u{uid}", first or f"N{uid}", last,
+                     time.time() - years_ago * YEAR)
+
+
+def within(years):
+    return Filter().with_period(time.time() - years * YEAR, None, f"до {years} г")
 
 
 async def main() -> None:
@@ -38,117 +44,122 @@ async def main() -> None:
     other = DB(db.pool, OTHER)
 
     try:
-        # ---------------- recipients ----------------
-        await db.upsert_recipients([person(i, a) for i, a in
-                                    ((1, 0.2), (2, 0.9), (3, 1.5), (4, 2.5), (5, 4.0))])
-        await db.upsert_recipients([Recipient(6, 60, None, "NoDate", None, None)])
+        # ---------------- recipients + gender ----------------
+        await db.upsert_recipients([
+            person(1, 0.2, "Анна"), person(2, 0.9, "Никита", "Сысоев"),
+            person(3, 1.5, "Саша"), person(4, 2.5, "Мария"), person(5, 4.0, "Олег"),
+        ])
+        await db.upsert_recipients([Recipient(6, 60, None, "Женя", "Петрова", None)])
         assert await db.recipients_total() == 6
-        ok("batch upsert writes recipients")
+        rows = {r["user_id"]: r["gender"] for r in await db.pool.fetch(
+            "SELECT user_id, gender FROM recipients WHERE account=$1", ACCOUNT)}
+        assert rows == {1: "f", 2: "m", 3: "u", 4: "f", 5: "m", 6: "f"}, rows
+        ok("upsert guesses gender on the way in")
 
-        await db.upsert_recipients([person(1, 0.1), person(2, 0.8)])
-        assert await db.recipients_total() == 6, "re-scan must update, not duplicate"
-        ok("re-scanning updates rows instead of duplicating them")
+        await db.pool.execute("UPDATE recipients SET gender=NULL WHERE account=$1", ACCOUNT)
+        assert await db.backfill_gender() == 6
+        assert await db.backfill_gender() == 0, "second backfill has nothing to do"
+        assert await db.pool.fetchval(
+            "SELECT COUNT(*) FROM recipients WHERE account=$1 AND gender IS NULL", ACCOUNT
+        ) == 0
+        ok("backfill fills gender for rows collected before the column existed")
 
-        assert await db.count_by_age(1) == 2
-        assert await db.count_by_age(2) == 3
-        assert await db.count_by_age(3) == 4
-        assert await db.count_by_age(None) == 6, "'all' includes the undated dialogue"
-        ok("years filter selects correctly; undated dialogues only under 'all'")
+        # ---------------- periods ----------------
+        assert await db.count(within(1)) == 2
+        assert await db.count(within(2)) == 3
+        assert await db.count(within(3)) == 4
+        assert await db.count(Filter()) == 6, "'все' includes the undated dialogue"
+        older = Filter().with_period(time.time() - 3 * YEAR, time.time() - 1 * YEAR, "1-3")
+        assert await db.count(older) == 2, "a range excludes both ends' outsiders"
+        only_old = Filter().with_period(None, time.time() - 2 * YEAR, "давнее 2 г")
+        assert await db.count(only_old) == 2, "open lower bound, undated excluded"
+        ok("period filters: presets, ranges, open-ended, undated only under 'все'")
 
-        # ---------------- account isolation ----------------
-        await other.upsert_recipients([person(1, 0.1), person(99, 0.1)])
-        assert await other.recipients_total() == 2
-        assert await db.recipients_total() == 6, "another account must not leak in"
+        # ---------------- gender ----------------
+        women = Filter(genders=frozenset({"f"}))
+        assert await db.count(women) == 3
+        assert await db.count(Filter(genders=frozenset({"m"}))) == 2
+        assert await db.count(Filter(genders=frozenset({"u"}))) == 1
+        assert await db.count(Filter(genders=frozenset({"f", "u"}))) == 4
+        assert await db.count(within(2).toggle("m").toggle("u")) == 1
+        ok("gender filters, alone and combined with a period")
+
+        by = await db.breakdown(within(3).toggle("m"))
+        assert by == {"f": 2, "m": 1, "u": 1}, "breakdown ignores the gender toggle on purpose"
+        sample = await db.sample(women, 10)
+        assert {r.user_id for r in sample} == {1, 4, 6} and all(r.gender == "f" for r in sample)
+        ok("breakdown shows all three groups; sample respects the filter")
+
+        # ---------------- isolation ----------------
+        await other.upsert_recipients([person(1, 0.1, "Олег"), person(99, 0.1)])
+        assert await other.recipients_total() == 2 and await db.recipients_total() == 6
         ok("two accounts sharing one database stay isolated")
 
+        # ---------------- settings ----------------
+        assert await db.get_settings() == {}
+        await db.set_setting("interval", "120", 111)
+        await db.set_setting("interval", "90", 222)
+        await db.set_setting("timezone", "Asia/Almaty")
+        assert await db.get_settings() == {"interval": "90", "timezone": "Asia/Almaty"}
+        assert await other.get_settings() == {}, "settings are per account"
+        ok("settings: upsert, last write wins, scoped per account")
+
         # ---------------- campaign freezes the promised list ----------------
-        shown = await db.count_by_age(2)
-        cid = await db.create_campaign("Привет!", None, 2.0, 111, 30.0)
-        assert (await db.progress(cid))["total"] == shown
-        ok(f"campaign queues exactly the {shown} recipients the panel promised")
+        flt = within(2).toggle("m")
+        shown = await db.count(flt)
+        cid = await db.create_campaign("Привет!", None, flt, 111, 180.0)
+        assert (await db.progress(cid))["total"] == shown == 2
+        row = await db.get_campaign(cid)
+        assert Filter.from_json(row["filter_json"]) == flt, "filter stored with the campaign"
+        ok("campaign queues exactly what the panel counted, and remembers its filter")
 
-        # ---------------- claim / in-flight ----------------
+        cid = await db.create_campaign("Привет!", None, within(2), 111, 180.0)
         first = await db.claim_next(cid)
-        assert first is not None and first.user_id == 1, "most recent dialogue first"
-        p = await db.progress(cid)
-        assert p.get("sending") == 1
-        assert p["pending"] == shown - 1 + 1, "in-flight still counts as outstanding"
-        ok("claim_next marks in-flight; it still shows as outstanding")
-
+        assert first.user_id == 1 and first.gender == "f", "most recent first, gender loaded"
         second = await db.claim_next(cid)
-        assert second is not None and second.user_id != first.user_id, "no double hand-out"
-        ok("a claimed recipient is never handed out twice")
-
+        assert second.user_id != first.user_id
         await db.mark(cid, first.user_id, "sent")
         await db.mark(cid, second.user_id, "skipped", "UserPrivacyRestrictedError")
         p = await db.progress(cid)
         assert p["sent"] == 1 and p["skipped"] == 1
-        assert await db.sent_since(cid, time.time() - 60) == 1
-        assert await db.sent_since(cid, time.time() + 60) == 0
-        ok("sent / skipped are tracked separately and time-windowed")
+        ok("claim / mark / progress")
 
-        # ---------------- crash recovery ----------------
         stranded = await db.claim_next(cid)
-        assert stranded is not None
-        assert (await db.progress(cid)).get("sending") == 1
-        freed = await db.release_inflight(cid)
-        assert freed == 1, f"expected 1 requeued, got {freed}"
-        assert (await db.progress(cid)).get("sending", 0) == 0
-        assert await db.claim_next(cid) is not None, "requeued person is claimable again"
+        assert await db.release_inflight(cid) == 1
+        assert (await db.claim_next(cid)).user_id == stranded.user_id
         await db.release_inflight(cid)
-        ok("a crash mid-send requeues the in-flight recipient instead of losing them")
+        ok("a crash mid-send requeues the in-flight recipient")
 
         # ---------------- double-send guard ----------------
-        assert await db.count_by_age(2, exclude_sent=False) == shown
-        assert await db.count_by_age(2) == shown - 1
-        assert await db.already_sent_in_range(2) == 1
-        cid2 = await db.create_campaign("Ещё раз", None, 2.0, 111, 30.0)
+        assert await db.count(within(2)) == 2 and await db.already_sent_in_range(within(2)) == 1
+        cid2 = await db.create_campaign("Ещё", None, within(2), 111, 180.0)
         got = []
         while (r := await db.claim_next(cid2)) is not None:
             got.append(r.user_id)
-        assert first.user_id not in got, "must not re-invite an already-sent user"
-        ok("a new campaign never re-sends to someone who already received one")
-
-        # The guard must not reach across accounts.
-        ocid = await other.create_campaign("x", None, None, 111, 30.0)
-        assert (await other.progress(ocid))["total"] == 2, "other account unaffected"
-        ok("the already-sent guard is scoped per account")
+        assert first.user_id not in got
+        by = await db.breakdown(within(2))
+        assert sum(by.values()) == 2, "breakdown excludes people already invited"
+        ok("nobody is invited twice; counts agree")
 
         # ---------------- resume ----------------
         await db.release_inflight(cid2)
-        await db.finish_campaign(cid2, "stopped", "Остановлено вручную")
+        await db.finish_campaign(cid2, "stopped", "manual")
+        await db.finish_campaign(cid, "stopped", "manual")
         res = await db.resumable_campaign()
-        assert res is not None and res["id"] == cid2 and res["pending_n"] > 0
-        await db.reopen_campaign(cid2, 42.0)
-        row = await db.get_campaign(cid2)
-        assert row["status"] == "running" and row["delay"] == 42.0
-        assert (await db.active_campaign())["id"] == cid2
-        ok("stopped campaigns resume and re-derive their pace")
-
-        while (r := await db.claim_next(cid2)) is not None:
-            await db.mark(cid2, r.user_id, "sent")
-        await db.finish_campaign(cid2, "done", "")
-        await db.finish_campaign(cid, "done", "")
-        assert await db.resumable_campaign() is None, "drained -> nothing to resume"
-        ok("a fully drained campaign is not offered for resume")
-
-        errors = await db.recent_errors(cid)
-        assert any(e["error"] for e in errors)
-        ok("recent errors are readable for the status screen")
+        assert res is not None and res["pending_n"] > 0
+        await db.reopen_campaign(res["id"], 60.0)
+        assert (await db.get_campaign(res["id"]))["status"] == "running"
+        ok("stopped campaigns resume")
 
     finally:
         async with db.pool.acquire() as conn:
+            scopes = [ACCOUNT, OTHER]
             await conn.execute(
                 "DELETE FROM deliveries WHERE campaign_id IN "
-                "(SELECT id FROM campaigns WHERE account = ANY($1::text[]))",
-                [ACCOUNT, OTHER],
-            )
-            await conn.execute(
-                "DELETE FROM campaigns WHERE account = ANY($1::text[])", [ACCOUNT, OTHER]
-            )
-            await conn.execute(
-                "DELETE FROM recipients WHERE account = ANY($1::text[])", [ACCOUNT, OTHER]
-            )
+                "(SELECT id FROM campaigns WHERE account = ANY($1::text[]))", scopes)
+            await conn.execute("DELETE FROM campaigns WHERE account = ANY($1::text[])", scopes)
+            await conn.execute("DELETE FROM recipients WHERE account = ANY($1::text[])", scopes)
+            await conn.execute("DELETE FROM settings WHERE account = ANY($1::text[])", scopes)
         await db.close()
 
 

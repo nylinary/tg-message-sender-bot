@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 import time
 from collections.abc import Iterable
 from dataclasses import dataclass, field
@@ -7,7 +8,7 @@ from datetime import datetime
 
 from aiogram import F, Router
 from aiogram.exceptions import TelegramBadRequest
-from aiogram.filters import BaseFilter, Command
+from aiogram.filters import BaseFilter, Command, StateFilter
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
@@ -15,12 +16,24 @@ from telethon import TelegramClient
 from telethon.extensions import html as tl_html
 
 from . import collect as collect_mod
+from . import settings as settings_mod
 from .config import Config
 from .db import DB
-from .scheduling import BADGE, IMPOSSIBLE, build_plan, describe, humanize
+from .filters import PERIOD_HELP, PRESETS, Filter, PeriodError, gender_button, parse_period, preset
+from .gender import FEMALE, ICONS, MALE, UNKNOWN
+from .scheduling import describe, estimate, humanize
 from .sender import SendWorker
+from .settings import (
+    INTERVAL_PRESETS,
+    JITTER_PRESETS,
+    TIMEZONE_PRESETS,
+    SettingError,
+)
 
+log = logging.getLogger("tgsender.bot")
 router = Router()
+
+DEFAULT_PRESET = "1y"
 
 
 class AdminGate(BaseFilter):
@@ -40,6 +53,7 @@ class AdminGate(BaseFilter):
     async def __call__(self, event: Message | CallbackQuery) -> bool:
         user = event.from_user
         if user is None:
+            log.info("Ignoring %s with no sender", type(event).__name__)
             return False
         if user.id in self.ids:
             return True
@@ -47,7 +61,16 @@ class AdminGate(BaseFilter):
         if name and name in self.usernames:
             self.ids.add(user.id)
             self.unresolved.discard(name)
+            log.info("Admin @%s recognised, id pinned as %s", name, user.id)
             return True
+        # Worth seeing in the logs: it separates "a stranger found the bot"
+        # from "an admin sent something no step expected".
+        log.info(
+            "Ignoring %s from non-admin id=%s @%s",
+            type(event).__name__,
+            user.id,
+            user.username or "-",
+        )
         return False
 
     def note_resolved(self, username: str, user_id: int) -> None:
@@ -70,14 +93,22 @@ class Panel:
     scan_counts: dict = field(default_factory=dict)
 
 
-class Compose(StatesGroup):
-    waiting_text = State()
-    waiting_age = State()
-    confirming = State()
+class Flow(StatesGroup):
+    compose_text = State()    # waiting for the invite text
+    filtering = State()       # the filter builder is on screen
+    custom_period = State()   # waiting for a typed period
+    confirming = State()      # the launch screen is on screen
+
+
+class SetFlow(StatesGroup):
+    deadline = State()
+    interval = State()
+    jitter = State()
+    timezone = State()
 
 
 # --------------------------------------------------------------------------- #
-# keyboards
+# small helpers
 # --------------------------------------------------------------------------- #
 
 
@@ -87,38 +118,6 @@ def kb(*rows: list[tuple[str, str]]) -> InlineKeyboardMarkup:
             [InlineKeyboardButton(text=t, callback_data=d) for t, d in row] for row in rows
         ]
     )
-
-
-async def main_menu(panel: Panel) -> InlineKeyboardMarkup:
-    if panel.worker.running:
-        return kb(
-            [("📊 Проверить статус", "status")],
-            [("⏹ Остановить рассылку", "stop")],
-        )
-    rows = [[("📝 Новая рассылка", "new")]]
-    resumable = await panel.db.resumable_campaign()
-    if resumable:
-        rows.append(
-            [(f"▶️ Продолжить #{resumable['id']} ({resumable['pending_n']} осталось)",
-              "resume")]
-        )
-    rows += [[("📊 Статус", "status")], [("🔄 Пересканировать диалоги", "rescan")]]
-    return kb(*rows)
-
-
-def age_keyboard(cfg: Config, counts: dict[str | int, int]) -> InlineKeyboardMarkup:
-    rows = []
-    for years in cfg.age_options:
-        label = f"{years} год" if years == 1 else f"{years} года" if years < 5 else f"{years} лет"
-        rows.append([(f"⏱ До {label} — {counts.get(years, 0)} чел.", f"age:{years}")])
-    rows.append([(f"♾ Все диалоги — {counts.get('all', 0)} чел.", "age:all")])
-    rows.append([("◀️ Отмена", "cancel")])
-    return kb(*rows)
-
-
-# --------------------------------------------------------------------------- #
-# helpers
-# --------------------------------------------------------------------------- #
 
 
 async def safe_edit(msg: Message, text: str, markup=None) -> None:
@@ -148,18 +147,26 @@ def bar(done: int, total: int, width: int = 16) -> str:
     return "█" * filled + "░" * (width - filled)
 
 
-def age_from_callback(data: str) -> float | None:
-    raw = data.split(":", 1)[1]
-    return None if raw == "all" else float(raw)
+async def load_settings(panel: Panel) -> settings_mod.Settings:
+    return await settings_mod.load(panel.db, panel.cfg)
+
+
+def default_filter(now: datetime) -> Filter:
+    since, until, label = preset(DEFAULT_PRESET, now)
+    return Filter().with_period(since, until, label)
+
+
+async def current_filter(state: FSMContext, now: datetime) -> Filter:
+    raw = (await state.get_data()).get("filter")
+    return Filter.from_json(raw) if raw else default_filter(now)
 
 
 async def ensure_fresh(panel: Panel, status_msg: Message) -> None:
     """Rescan dialogues if the cache is empty or stale."""
     last = await panel.db.last_collected_at()
     fresh = last is not None and (time.time() - last) < panel.cfg.stale_after_hours * 3600
-    if fresh:
-        return
-    await run_scan(panel, status_msg)
+    if not fresh:
+        await run_scan(panel, status_msg)
 
 
 async def run_scan(panel: Panel, status_msg: Message) -> None:
@@ -181,19 +188,245 @@ async def run_scan(panel: Panel, status_msg: Message) -> None:
         )
 
     try:
-        counts = await collect_mod.collect(panel.client, panel.db, progress=progress)
-        panel.scan_counts = counts
+        panel.scan_counts = await collect_mod.collect(
+            panel.client, panel.db, progress=progress
+        )
     finally:
         panel.scanning = False
 
 
+# --------------------------------------------------------------------------- #
+# main menu
+# --------------------------------------------------------------------------- #
+
+
+async def main_menu(panel: Panel) -> InlineKeyboardMarkup:
+    if panel.worker.running:
+        return kb(
+            [("📊 Проверить статус", "status")],
+            [("⏹ Остановить рассылку", "stop")],
+            [("🔎 Посчитать получателей", "count")],
+            [("⚙️ Настройки", "set")],
+        )
+    rows = [[("📝 Новая рассылка", "new")], [("🔎 Посчитать получателей", "count")]]
+    resumable = await panel.db.resumable_campaign()
+    if resumable:
+        rows.append(
+            [(f"▶️ Продолжить #{resumable['id']} ({resumable['pending_n']} осталось)",
+              "resume")]
+        )
+    rows += [
+        [("📊 Статус", "status"), ("⚙️ Настройки", "set")],
+        [("🔄 Пересканировать диалоги", "rescan")],
+    ]
+    return kb(*rows)
+
+
+async def home_text(panel: Panel) -> str:
+    s = await load_settings(panel)
+    total = await panel.db.recipients_total()
+    return (
+        "👋 <b>Панель рассылки приглашений</b>\n\n"
+        f"Аккаунт-отправитель: <code>{panel.cfg.account}</code>\n"
+        f"Диалогов в базе: <b>{total}</b>\n"
+        f"🏁 Дедлайн: <b>{s.deadline:%d.%m.%Y %H:%M}</b>\n"
+        f"⏱ Интервал: <b>{humanize(s.interval)}</b> ±{s.jitter * 100:.0f}%\n"
+        f"🌍 {s.timezone}, сейчас {s.now():%H:%M}\n\n"
+        + ("🟢 Сейчас идёт рассылка." if panel.worker.running else "Готов к работе.")
+    )
+
+
+# --------------------------------------------------------------------------- #
+# the filter builder — shared by 🔎 Посчитать and 📝 Новая рассылка
+# --------------------------------------------------------------------------- #
+
+
+async def builder_view(panel: Panel, state: FSMContext) -> tuple[str, InlineKeyboardMarkup]:
+    s = await load_settings(panel)
+    data = await state.get_data()
+    flt = await current_filter(state, s.now())
+    mode = data.get("mode", "count")
+
+    by_gender = await panel.db.breakdown(flt)
+    in_period = sum(by_gender.values())
+    selected = sum(by_gender.get(g, 0) for g in flt.genders)
+    already = await panel.db.already_sent_in_range(flt)
+
+    title = (
+        "📝 <b>Кому отправляем?</b>" if mode == "campaign"
+        else "🔎 <b>Сколько получателей</b>"
+    )
+    lines = [
+        title,
+        "",
+        f"📅 Последний диалог: <b>{flt.label}</b>",
+        f"🚻 Пол: <b>{flt.genders_text()}</b>",
+        "",
+        f"За этот период: {in_period}",
+        f"    ♀ {by_gender.get(FEMALE, 0)}  ·  ♂ {by_gender.get(MALE, 0)}"
+        f"  ·  ❔ {by_gender.get(UNKNOWN, 0)}",
+        f"👥 <b>Выбрано: {selected}</b>",
+    ]
+    if already:
+        lines.append(
+            f"\n<i>Ещё {already} под фильтр подходят, но уже получали приглашение — "
+            f"им не отправим.</i>"
+        )
+    lines.append(
+        "\n<i>Пол угадан по имени и фамилии — ошибки будут. "
+        "«👀 Кто попал» покажет примеры.</i>"
+    )
+
+    def period_button(key: str, button: str, description: str) -> tuple[str, str]:
+        mark = "• " if flt.label == description else ""
+        return (f"{mark}{button}", f"f:p:{key}")
+
+    presets = [period_button(k, b, d) for k, b, d, _ in PRESETS]
+    rows = [
+        presets[:3],
+        presets[3:],
+        [("✏️ Свой период / даты", "f:custom")],
+        [(gender_button(flt, g), f"f:g:{g}") for g in (FEMALE, MALE, UNKNOWN)],
+        [("👀 Кто попал", "f:who")],
+    ]
+    if mode == "campaign":
+        rows.append([("➡️ Далее", "f:next")])
+    else:
+        rows.append([("📝 Разослать этим людям", "f:use")])
+    rows.append([("◀️ Меню", "menu")])
+    return "\n".join(lines), kb(*rows)
+
+
+async def show_builder(msg: Message, panel: Panel, state: FSMContext, *, edit: bool) -> None:
+    await state.set_state(Flow.filtering)
+    text, markup = await builder_view(panel, state)
+    if edit:
+        await safe_edit(msg, text, markup)
+    else:
+        await msg.answer(text, reply_markup=markup)
+
+
+async def confirm_view(panel: Panel, state: FSMContext) -> tuple[str, InlineKeyboardMarkup]:
+    s = await load_settings(panel)
+    data = await state.get_data()
+    flt = await current_filter(state, s.now())
+    recipients = await panel.db.count(flt)
+    already = await panel.db.already_sent_in_range(flt)
+    est = estimate(
+        recipients, s.interval, s.jitter, s.deadline,
+        panel.cfg.pacing, panel.cfg.risk, s.now(),
+    )
+
+    preview = data.get("text", "")
+    if len(preview) > 600:
+        preview = preview[:600] + "…"
+    excluded = (
+        f"<i>Ещё {already} подходят, но уже получали — им не отправим.</i>\n"
+        if already else ""
+    )
+    body = (
+        "<b>Проверь перед запуском</b>\n\n"
+        f"Фильтр: {flt.summary()}\n{excluded}\n"
+        f"{describe(est, panel.cfg.pacing, panel.cfg.risk, s.timezone)}\n\n"
+        f"<i>Интервал, джиттер и дедлайн можно менять в ⚙️ Настройках "
+        f"и во время рассылки.</i>\n\n"
+        f"─────────\n{preview}"
+    )
+    rows = []
+    if recipients > 0 and est.capacity > 0:
+        rows.append([("🚀 Запустить", "go")])
+    rows += [[("◀️ Фильтр", "f:back"), ("⚙️ Настройки", "set")], [("❌ Отмена", "cancel")]]
+    return body, kb(*rows)
+
+
+# --------------------------------------------------------------------------- #
+# settings screen
+# --------------------------------------------------------------------------- #
+
+
+async def settings_view(panel: Panel) -> tuple[str, InlineKeyboardMarkup]:
+    s = await load_settings(panel)
+    p = panel.cfg.pacing
+    lo, hi = s.gap_range
+    left = (s.deadline - s.now()).total_seconds()
+    until = f"через {humanize(left)}" if left > 0 else "⛔️ уже прошёл"
+    text = (
+        "⚙️ <b>Настройки</b>\n\n"
+        f"🏁 Дедлайн: <b>{s.deadline:%d.%m.%Y %H:%M}</b> ({until})\n"
+        f"⏱ Интервал: <b>{humanize(s.interval)}</b> (~{3600 / s.interval:.0f}/час)\n"
+        f"🎲 Джиттер: <b>±{s.jitter * 100:.0f}%</b> → каждая пауза от "
+        f"{humanize(lo)} до {humanize(hi)}\n"
+        f"🌍 Часовой пояс: <b>{s.timezone}</b> (сейчас {s.now():%d.%m %H:%M})\n"
+        f"🌙 Тихие часы: {p.quiet_start:02d}:00–{p.quiet_end:02d}:00\n\n"
+        "<i>Изменения действуют сразу, в том числе на идущую рассылку. "
+        "После дедлайна отправка останавливается.</i>"
+    )
+    return text, kb(
+        [("🏁 Дедлайн", "set:dl"), ("⏱ Интервал", "set:int")],
+        [("🎲 Джиттер", "set:jit"), ("🌍 Часовой пояс", "set:tz")],
+        [("◀️ Меню", "menu")],
+    )
+
+
+SETTING_PROMPTS = {
+    "dl": (
+        SetFlow.deadline,
+        "🏁 <b>Новый дедлайн</b>\n\nНапиши дату и время, например:\n"
+        "<code>25.09.2026 21:00</code> или <code>25.09 21:00</code>\n\n"
+        "Время — по часовому поясу из настроек. Без времени — до конца дня.",
+    ),
+    "int": (
+        SetFlow.interval,
+        "⏱ <b>Свой интервал</b>\n\nНапиши паузу между сообщениями: "
+        "<code>180</code> (секунды), <code>3м</code>, <code>2м30с</code>.",
+    ),
+    "jit": (
+        SetFlow.jitter,
+        "🎲 <b>Свой джиттер</b>\n\nНапиши процент от 0 до 90, например <code>35</code>.",
+    ),
+    "tz": (
+        SetFlow.timezone,
+        "🌍 <b>Свой часовой пояс</b>\n\nНапиши название вроде "
+        "<code>Europe/Moscow</code> или смещение <code>UTC+3</code>.",
+    ),
+}
+
+
+def interval_keyboard() -> InlineKeyboardMarkup:
+    presets = [(humanize(v), f"set:int:{v}") for v in INTERVAL_PRESETS]
+    return kb(presets[:3], presets[3:], [("✏️ Своё", "set:int:custom")],
+              [("◀️ Настройки", "set")])
+
+
+def jitter_keyboard() -> InlineKeyboardMarkup:
+    presets = [(f"±{v}%", f"set:jit:{v}") for v in JITTER_PRESETS]
+    return kb(presets, [("✏️ Своё", "set:jit:custom")], [("◀️ Настройки", "set")])
+
+
+def timezone_keyboard() -> InlineKeyboardMarkup:
+    buttons = [(label, f"set:tz:{zone}") for label, zone in TIMEZONE_PRESETS]
+    rows = [buttons[i:i + 3] for i in range(0, len(buttons), 3)]
+    return kb(*rows, [("✏️ Другой", "set:tz:custom")], [("◀️ Настройки", "set")])
+
+
+async def save_setting(panel: Panel, key: str, value: str, user_id: int) -> None:
+    await panel.db.set_setting(key, value, user_id)
+    log.info("Setting %s=%s changed by %s", key, value, user_id)
+
+
+# --------------------------------------------------------------------------- #
+# status
+# --------------------------------------------------------------------------- #
+
+
 async def status_text(panel: Panel) -> str:
     snap = await panel.worker.snapshot()
+    s = await load_settings(panel)
     if not snap.get("campaign_id"):
         total = await panel.db.recipients_total()
         last = await panel.db.last_collected_at()
         when = (
-            datetime.fromtimestamp(last).strftime("%d.%m %H:%M") if last else "никогда"
+            datetime.fromtimestamp(last, s.tz).strftime("%d.%m %H:%M") if last else "никогда"
         )
         return (
             "Рассылок пока не было.\n\n"
@@ -216,7 +449,8 @@ async def status_text(panel: Panel) -> str:
     }.get(snap["status"], f"<b>{snap['status']}</b>")
 
     lines = [
-        head,
+        head + f" #{snap['campaign_id']}",
+        f"<i>{Filter.from_json(snap.get('filter_json')).summary()}</i>",
         "",
         f"<code>{bar(sent + skipped + failed, total)}</code>",
         f"Отправлено: <b>{sent}</b> из <b>{total}</b>",
@@ -227,30 +461,30 @@ async def status_text(panel: Panel) -> str:
     if failed:
         lines.append(f"Ошибок: {failed}")
 
-    lines.append("")
-    lines.append(f"За последний час: <b>{snap['last_hour']}</b>")
-
-    if snap["delay"]:
-        lines.append(f"Интервал: ~{humanize(snap['delay'] * snap['multiplier'])}")
+    lines += [
+        "",
+        f"За последний час: <b>{snap['last_hour']}</b>",
+        f"Интервал: ~{humanize(s.interval * snap['multiplier'])} ±{s.jitter * 100:.0f}%",
+    ]
     if snap["multiplier"] > 1.05:
-        lines.append(
-            f"⚠️ Замедление ×{snap['multiplier']:.1f} после FLOOD_WAIT от Telegram"
-        )
+        lines.append(f"⚠️ Замедление ×{snap['multiplier']:.1f} после FLOOD_WAIT от Telegram")
 
     if snap["running"] and pending:
-        eta = pending * snap["delay"] * snap["multiplier"]
-        finish = datetime.fromtimestamp(time.time() + eta)
-        lines.append(f"Закончит примерно: <b>{finish:%d.%m %H:%M}</b>")
-        if finish > panel.cfg.deadline:
+        est = estimate(
+            pending, s.interval * snap["multiplier"], s.jitter, s.deadline,
+            panel.cfg.pacing, panel.cfg.risk, s.now(),
+        )
+        lines.append(f"Закончит примерно: <b>{est.finishes_at:%d.%m %H:%M}</b>")
+        if not est.fits:
             lines.append(
-                f"⛔️ Это позже дедлайна {panel.cfg.deadline:%d.%m %H:%M}"
+                f"⛔️ К дедлайну {s.deadline:%d.%m %H:%M} не успеет ~{est.missed} чел. "
+                f"Уменьши интервал в ⚙️ Настройках."
             )
 
     if snap["waiting_for"] > 5:
         lines.append(
             f"\n⏸ Сейчас пауза: {humanize(snap['waiting_for'])} ({snap['wait_reason']})"
         )
-
     if snap["stop_reason"]:
         lines.append(f"\n<i>{snap['stop_reason']}</i>")
 
@@ -259,44 +493,47 @@ async def status_text(panel: Panel) -> str:
         lines.append("\n<i>Последние ошибки:</i>")
         for e in errors:
             lines.append(f"<i>· {e['user_id']}: {e['error']}</i>")
-
     return "\n".join(lines)
 
 
 # --------------------------------------------------------------------------- #
-# handlers
+# handlers: menu
 # --------------------------------------------------------------------------- #
 
 
 @router.message(Command("start", "menu", "cancel"))
 async def cmd_start(message: Message, state: FSMContext, panel: Panel) -> None:
     await state.clear()
-    running = panel.worker.running
-    total = await panel.db.recipients_total()
-    await message.answer(
-        "👋 <b>Панель рассылки приглашений</b>\n\n"
-        f"Аккаунт-отправитель: <code>{panel.cfg.account}</code>\n"
-        f"Диалогов в базе: <b>{total}</b>\n"
-        f"Дедлайн: <b>{panel.cfg.deadline:%d.%m.%Y %H:%M}</b>\n\n"
-        + ("🟢 Сейчас идёт рассылка." if running else "Готов к работе."),
-        reply_markup=await main_menu(panel),
-    )
+    await message.answer(await home_text(panel), reply_markup=await main_menu(panel))
 
 
 @router.callback_query(F.data == "menu")
 async def cb_menu(cq: CallbackQuery, state: FSMContext, panel: Panel) -> None:
     await state.clear()
     await cq.answer()
-    await safe_edit(
-        cq.message, "Главное меню.", await main_menu(panel)
-    )
+    await safe_edit(cq.message, await home_text(panel), await main_menu(panel))
 
 
 @router.callback_query(F.data == "cancel")
 async def cb_cancel(cq: CallbackQuery, state: FSMContext, panel: Panel) -> None:
     await state.clear()
     await cq.answer("Отменено")
-    await safe_edit(cq.message, "Отменено.", await main_menu(panel))
+    await safe_edit(cq.message, await home_text(panel), await main_menu(panel))
+
+
+# --------------------------------------------------------------------------- #
+# handlers: count and compose
+# --------------------------------------------------------------------------- #
+
+
+@router.callback_query(F.data == "count")
+async def cb_count(cq: CallbackQuery, state: FSMContext, panel: Panel) -> None:
+    await cq.answer()
+    await state.clear()
+    await state.update_data(mode="count")
+    await safe_edit(cq.message, "🔍 Проверяю список диалогов…")
+    await ensure_fresh(panel, cq.message)
+    await show_builder(cq.message, panel, state, edit=True)
 
 
 @router.callback_query(F.data == "new")
@@ -309,7 +546,9 @@ async def cb_new(cq: CallbackQuery, state: FSMContext, panel: Panel) -> None:
             await main_menu(panel),
         )
         return
-    await state.set_state(Compose.waiting_text)
+    await state.clear()
+    await state.update_data(mode="campaign")
+    await state.set_state(Flow.compose_text)
     await safe_edit(
         cq.message,
         "📝 Пришли следующим сообщением текст приглашения.\n\n"
@@ -319,7 +558,7 @@ async def cb_new(cq: CallbackQuery, state: FSMContext, panel: Panel) -> None:
     )
 
 
-@router.message(Compose.waiting_text)
+@router.message(Flow.compose_text)
 async def on_text(message: Message, state: FSMContext, panel: Panel) -> None:
     if not message.text:
         await message.answer(
@@ -327,94 +566,169 @@ async def on_text(message: Message, state: FSMContext, panel: Panel) -> None:
             reply_markup=kb([("◀️ Отмена", "cancel")]),
         )
         return
-
     text, parse_mode = resolve_parse_mode(message.html_text, message.text)
-    await state.update_data(text=text, parse_mode=parse_mode)
+    await state.update_data(text=text, parse_mode=parse_mode, mode="campaign")
 
     status_msg = await message.answer("🔍 Проверяю список диалогов…")
     await ensure_fresh(panel, status_msg)
-
-    counts: dict[str | int, int] = {"all": await panel.db.count_by_age(None)}
-    for years in panel.cfg.age_options:
-        counts[years] = await panel.db.count_by_age(years)
-
-    await state.set_state(Compose.waiting_age)
-    await safe_edit(
-        status_msg,
-        "✅ Текст сохранён.\n\n"
-        "Кому отправляем? Выбери, насколько свежим должен быть последний диалог:",
-        age_keyboard(panel.cfg, counts),
-    )
+    if (await state.get_data()).get("filter"):
+        # Came here from 🔎 Посчитать → «Разослать этим людям»: filter is set.
+        await state.set_state(Flow.confirming)
+        body, markup = await confirm_view(panel, state)
+        await safe_edit(status_msg, body, markup)
+    else:
+        await show_builder(status_msg, panel, state, edit=True)
 
 
-@router.callback_query(Compose.waiting_age, F.data.startswith("age:"))
-async def on_age(cq: CallbackQuery, state: FSMContext, panel: Panel) -> None:
+# --------------------------------------------------------------------------- #
+# handlers: the builder
+# --------------------------------------------------------------------------- #
+
+
+@router.callback_query(Flow.filtering, F.data.startswith("f:p:"))
+async def on_preset(cq: CallbackQuery, state: FSMContext, panel: Panel) -> None:
     await cq.answer()
-    years = age_from_callback(cq.data)
-    recipients = await panel.db.count_by_age(years)
+    s = await load_settings(panel)
+    flt = await current_filter(state, s.now())
+    since, until, label = preset(cq.data.split(":", 2)[2], s.now())
+    await state.update_data(filter=flt.with_period(since, until, label).to_json())
+    await show_builder(cq.message, panel, state, edit=True)
 
-    plan = build_plan(recipients, panel.cfg.deadline, panel.cfg.pacing, panel.cfg.risk)
-    await state.update_data(max_age=years, delay=plan.delay)
-    await state.set_state(Compose.confirming)
 
-    data = await state.get_data()
-    preview = data["text"]
-    if len(preview) > 600:
-        preview = preview[:600] + "…"
+@router.callback_query(Flow.filtering, F.data.startswith("f:g:"))
+async def on_gender(cq: CallbackQuery, state: FSMContext, panel: Panel) -> None:
+    s = await load_settings(panel)
+    flt = await current_filter(state, s.now())
+    gender = cq.data.split(":", 2)[2]
+    toggled = flt.toggle(gender)
+    if toggled.genders == flt.genders:
+        await cq.answer("Хотя бы одна группа должна остаться", show_alert=True)
+        return
+    await cq.answer()
+    await state.update_data(filter=toggled.to_json())
+    await show_builder(cq.message, panel, state, edit=True)
 
-    scope = "все диалоги" if years is None else f"последний диалог не старше {years:g} г."
-    already = await panel.db.already_sent_in_range(years)
-    excluded = (
-        f"\n<i>Ещё {already} чел. под этот фильтр подходят, но уже получали "
-        f"сообщение в прошлых рассылках — им не отправим.</i>\n"
-        if already
-        else ""
+
+@router.callback_query(Flow.filtering, F.data == "f:custom")
+async def on_custom_period(cq: CallbackQuery, state: FSMContext) -> None:
+    await cq.answer()
+    await state.set_state(Flow.custom_period)
+    await safe_edit(cq.message, PERIOD_HELP, kb([("◀️ Назад", "f:back")]))
+
+
+@router.message(Flow.custom_period)
+async def on_period_text(message: Message, state: FSMContext, panel: Panel) -> None:
+    s = await load_settings(panel)
+    try:
+        since, until, label = parse_period(message.text or "", s.now())
+    except PeriodError as exc:
+        await message.answer(f"⚠️ {exc}\n\nПопробуй ещё раз или нажми «Назад».",
+                             reply_markup=kb([("◀️ Назад", "f:back")]))
+        return
+    flt = await current_filter(state, s.now())
+    await state.update_data(filter=flt.with_period(since, until, label).to_json())
+    await show_builder(message, panel, state, edit=False)
+
+
+@router.callback_query(Flow.filtering, F.data == "f:who")
+async def on_who(cq: CallbackQuery, state: FSMContext, panel: Panel) -> None:
+    await cq.answer()
+    s = await load_settings(panel)
+    flt = await current_filter(state, s.now())
+    people = await panel.db.sample(flt, 25)
+    if not people:
+        body = "Под фильтр никто не попал."
+    else:
+        lines = [f"👀 <b>Случайные {len(people)} из выбранных</b>", ""]
+        for r in people:
+            when = (
+                datetime.fromtimestamp(r.last_message_at, s.tz).strftime("%d.%m.%y")
+                if r.last_message_at else "—"
+            )
+            handle = f" @{r.username}" if r.username else ""
+            lines.append(f"{ICONS.get(r.gender or UNKNOWN, '❔')} {r.label}{handle} · {when}")
+        lines.append("\n<i>Значок — угаданный пол, дата — последний диалог.</i>")
+        body = "\n".join(lines)
+    await safe_edit(cq.message, body, kb([("🔄 Другие", "f:who")], [("◀️ К фильтру", "f:back")]))
+
+
+@router.callback_query(
+    StateFilter(Flow.filtering, Flow.custom_period, Flow.confirming), F.data == "f:back"
+)
+async def on_back_to_builder(cq: CallbackQuery, state: FSMContext, panel: Panel) -> None:
+    await cq.answer()
+    await show_builder(cq.message, panel, state, edit=True)
+
+
+@router.callback_query(Flow.filtering, F.data == "f:use")
+async def on_use_filter(cq: CallbackQuery, state: FSMContext, panel: Panel) -> None:
+    """From 🔎 Посчитать straight into a campaign with the same filter."""
+    if panel.worker.running:
+        await cq.answer("Сначала останови текущую рассылку", show_alert=True)
+        return
+    await cq.answer()
+    s = await load_settings(panel)
+    flt = await current_filter(state, s.now())
+    await state.update_data(mode="campaign", filter=flt.to_json())
+    await state.set_state(Flow.compose_text)
+    await safe_edit(
+        cq.message,
+        f"📝 Фильтр: <b>{flt.summary()}</b>\n\n"
+        "Пришли следующим сообщением текст приглашения. Он уйдёт всем "
+        "<b>как есть</b>, форматирование и ссылки сохранятся.",
+        kb([("◀️ Отмена", "cancel")]),
     )
-    body = (
-        f"<b>Проверь перед запуском</b>\n\n"
-        f"Фильтр: {scope}\n"
-        f"{excluded}\n"
-        f"{describe(plan, panel.cfg.risk)}\n\n"
-        f"─────────\n{preview}"
-    )
-
-    buttons = []
-    if recipients > 0:
-        label = "🚀 Запустить" if plan.feasible else "🚀 Запустить (не успеем в срок)"
-        buttons.append([(label, "go")])
-    buttons.append([("◀️ Назад", "new"), ("❌ Отмена", "cancel")])
-    await safe_edit(cq.message, body, kb(*buttons))
 
 
-@router.callback_query(Compose.confirming, F.data == "go")
+@router.callback_query(Flow.filtering, F.data == "f:next")
+async def on_next(cq: CallbackQuery, state: FSMContext, panel: Panel) -> None:
+    await cq.answer()
+    await state.set_state(Flow.confirming)
+    body, markup = await confirm_view(panel, state)
+    await safe_edit(cq.message, body, markup)
+
+
+@router.callback_query(Flow.confirming, F.data == "go")
 async def on_go(cq: CallbackQuery, state: FSMContext, panel: Panel) -> None:
-    data = await state.get_data()
-    await state.clear()
-
     if panel.worker.running:
         await cq.answer("Рассылка уже идёт", show_alert=True)
         return
+    s = await load_settings(panel)
+    data = await state.get_data()
+    flt = await current_filter(state, s.now())
+    if not data.get("text"):
+        await cq.answer("Текст потерялся — начни заново", show_alert=True)
+        return
+    await state.clear()
 
     campaign_id = await panel.db.create_campaign(
         body=data["text"],
-        parse_mode=data["parse_mode"],
-        max_age_years=data["max_age"],
+        parse_mode=data.get("parse_mode"),
+        flt=flt,
         created_by=cq.from_user.id,
-        delay=data["delay"],
+        interval=s.interval,
     )
     total = (await panel.db.progress(campaign_id)).get("total", 0)
+    if total == 0:
+        await panel.db.finish_campaign(campaign_id, "done", "Под фильтр никто не попал")
+        await cq.answer("Под фильтр никто не попал", show_alert=True)
+        return
     panel.worker.start(campaign_id)
-
     await cq.answer("Запущено")
     await safe_edit(
         cq.message,
         f"🚀 <b>Рассылка #{campaign_id} запущена.</b>\n\n"
+        f"Фильтр: {flt.summary()}\n"
         f"Получателей: <b>{total}</b>\n"
-        f"Интервал: ~{humanize(data['delay'])}\n\n"
-        "Можно закрыть бота — она идёт в фоне. "
-        "Нажми «Статус», чтобы посмотреть прогресс.",
+        f"Интервал: ~{humanize(s.interval)} ±{s.jitter * 100:.0f}%\n\n"
+        "Можно закрыть бота — она идёт в фоне. «Статус» покажет прогресс.",
         await main_menu(panel),
     )
+
+
+# --------------------------------------------------------------------------- #
+# handlers: running campaigns
+# --------------------------------------------------------------------------- #
 
 
 @router.callback_query(F.data == "resume")
@@ -423,32 +737,37 @@ async def cb_resume(cq: CallbackQuery, state: FSMContext, panel: Panel) -> None:
     if panel.worker.running:
         await cq.answer("Рассылка уже идёт", show_alert=True)
         return
-
     campaign = await panel.db.resumable_campaign()
     if campaign is None:
         await cq.answer("Продолжать нечего", show_alert=True)
-        await safe_edit(cq.message, "Незавершённых рассылок нет.", await main_menu(panel))
+        await safe_edit(cq.message, await home_text(panel), await main_menu(panel))
         return
 
-    # Re-derive the pace: the deadline is closer than when it first started.
+    s = await load_settings(panel)
     remaining = campaign["pending_n"]
-    plan = build_plan(remaining, panel.cfg.deadline, panel.cfg.pacing, panel.cfg.risk)
-    await panel.db.reopen_campaign(campaign["id"], plan.delay)
+    est = estimate(
+        remaining, s.interval, s.jitter, s.deadline,
+        panel.cfg.pacing, panel.cfg.risk, s.now(),
+    )
+    if est.seconds_available <= 0:
+        await cq.answer(
+            "Дедлайн уже прошёл — сдвинь его в ⚙️ Настройках", show_alert=True
+        )
+        return
+    await panel.db.reopen_campaign(campaign["id"], s.interval)
     panel.worker.start(campaign["id"])
 
     await cq.answer("Продолжаю")
-    warning = (
-        f"\n\n{BADGE[IMPOSSIBLE]} До дедлайна уже не успеть — пойдёт на максимальной "
-        f"скорости и всё равно не хватит времени."
-        if plan.risk == IMPOSSIBLE
-        else ""
+    late = (
+        f"\n\n⛔️ К дедлайну не успеет ~{est.missed} чел. — уменьши интервал в "
+        f"⚙️ Настройках, если нужно всем."
+        if not est.fits else f"\nЗакончит ~{est.finishes_at:%d.%m %H:%M}."
     )
     await safe_edit(
         cq.message,
         f"▶️ <b>Рассылка #{campaign['id']} продолжена.</b>\n\n"
         f"Осталось: <b>{remaining}</b>\n"
-        f"Новый интервал: ~{humanize(plan.delay)}"
-        f"{warning}",
+        f"Интервал: ~{humanize(s.interval)} ±{s.jitter * 100:.0f}%{late}",
         await main_menu(panel),
     )
 
@@ -493,10 +812,10 @@ async def cb_stop(cq: CallbackQuery, panel: Panel) -> None:
 
 @router.callback_query(F.data == "rescan")
 async def cb_rescan(cq: CallbackQuery, panel: Panel) -> None:
-    await cq.answer()
     if panel.worker.running:
         await cq.answer("Нельзя сканировать во время рассылки", show_alert=True)
         return
+    await cq.answer()
     await safe_edit(cq.message, "🔍 Сканирую диалоги…")
     await run_scan(panel, cq.message)
     c = panel.scan_counts
@@ -507,6 +826,97 @@ async def cb_rescan(cq: CallbackQuery, panel: Panel) -> None:
         f"Пропущено (боты, каналы, группы): {c.get('skipped', 0)}",
         await main_menu(panel),
     )
+
+
+# --------------------------------------------------------------------------- #
+# handlers: settings
+# --------------------------------------------------------------------------- #
+
+
+@router.callback_query(F.data == "set")
+async def cb_settings(cq: CallbackQuery, state: FSMContext, panel: Panel) -> None:
+    await cq.answer()
+    await state.clear()
+    text, markup = await settings_view(panel)
+    await safe_edit(cq.message, text, markup)
+
+
+@router.callback_query(F.data.startswith("set:"))
+async def cb_setting(cq: CallbackQuery, state: FSMContext, panel: Panel) -> None:
+    parts = cq.data.split(":", 2)
+    what = parts[1]
+    value = parts[2] if len(parts) > 2 else None
+
+    if value is None and what == "int":
+        await cq.answer()
+        await safe_edit(cq.message, "⏱ <b>Интервал между сообщениями</b>", interval_keyboard())
+        return
+    if value is None and what == "jit":
+        await cq.answer()
+        await safe_edit(
+            cq.message,
+            "🎲 <b>Джиттер</b>\n\nНа сколько случайно растягивать или сжимать каждую "
+            "паузу. Ровный шаг «ровно каждые 180 с» — машинный след, живой человек "
+            "так не пишет.",
+            jitter_keyboard(),
+        )
+        return
+    if value is None and what == "tz":
+        await cq.answer()
+        await safe_edit(cq.message, "🌍 <b>Часовой пояс</b>", timezone_keyboard())
+        return
+    if what == "dl" or value == "custom":
+        await cq.answer()
+        new_state, prompt = SETTING_PROMPTS[what]
+        await state.set_state(new_state)
+        await safe_edit(cq.message, prompt, kb([("◀️ Настройки", "set")]))
+        return
+
+    try:
+        if what == "int":
+            stored = str(settings_mod.parse_interval(value, panel.cfg.pacing.min_interval))
+        elif what == "jit":
+            stored = str(settings_mod.parse_jitter(value))
+        elif what == "tz":
+            stored = settings_mod.parse_timezone(value)
+        else:
+            raise SettingError("Неизвестная настройка")
+    except SettingError as exc:
+        await cq.answer(str(exc), show_alert=True)
+        return
+
+    key = {"int": "interval", "jit": "jitter", "tz": "timezone"}[what]
+    await save_setting(panel, key, stored, cq.from_user.id)
+    await cq.answer("Сохранено")
+    text, markup = await settings_view(panel)
+    await safe_edit(cq.message, text, markup)
+
+
+@router.message(StateFilter(SetFlow.deadline, SetFlow.interval, SetFlow.jitter, SetFlow.timezone))
+async def on_setting_text(message: Message, state: FSMContext, panel: Panel) -> None:
+    current = await state.get_state()
+    raw = (message.text or "").strip()
+    s = await load_settings(panel)
+    try:
+        if current == SetFlow.deadline.state:
+            key, value = "deadline", settings_mod.parse_deadline(raw, s.now()).isoformat(
+                timespec="minutes"
+            )
+        elif current == SetFlow.interval.state:
+            key = "interval"
+            value = str(settings_mod.parse_interval(raw, panel.cfg.pacing.min_interval))
+        elif current == SetFlow.jitter.state:
+            key, value = "jitter", str(settings_mod.parse_jitter(raw))
+        else:
+            key, value = "timezone", settings_mod.parse_timezone(raw)
+    except SettingError as exc:
+        await message.answer(f"⚠️ {exc}", reply_markup=kb([("◀️ Настройки", "set")]))
+        return
+
+    await save_setting(panel, key, value, message.from_user.id)
+    await state.clear()
+    text, markup = await settings_view(panel)
+    await message.answer("✅ Сохранено.\n\n" + text, reply_markup=markup)
 
 
 # --------------------------------------------------------------------------- #
@@ -536,6 +946,6 @@ async def msg_fallback(message: Message, state: FSMContext, panel: Panel) -> Non
     """Anything an admin sends that no step expected."""
     await state.clear()
     await message.answer(
-        "Не понял. Чтобы отправить приглашения, начни с «Новая рассылка».",
+        "Не понял. Выбери действие в меню.",
         reply_markup=await main_menu(panel),
     )

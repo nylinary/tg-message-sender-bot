@@ -1,0 +1,239 @@
+from __future__ import annotations
+
+import asyncio
+import random
+import time
+from datetime import datetime, timedelta
+
+from telethon import TelegramClient, errors
+from telethon.tl.types import InputPeerUser
+
+from .config import Config
+from .db import DB
+from .scheduling import build_plan, is_quiet
+
+# The recipient is unreachable and always will be — skip, keep going.
+PERMANENT_ERRORS = (
+    errors.UserPrivacyRestrictedError,
+    errors.UserIsBlockedError,
+    errors.InputUserDeactivatedError,
+    errors.PeerIdInvalidError,
+    errors.UserIdInvalidError,
+    errors.ChatWriteForbiddenError,
+)
+
+# Something is wrong with *our* account — pushing on makes it permanent.
+ACCOUNT_ERRORS = (
+    errors.PeerFloodError,
+    errors.UserDeactivatedBanError,
+    errors.AuthKeyUnregisteredError,
+    errors.SessionRevokedError,
+    errors.SessionExpiredError,
+)
+
+REPLAN_EVERY = 25
+MAX_FLOOD_WAIT = 6 * 3600
+
+
+class SendWorker:
+    """Owns the one campaign that may be in flight at a time."""
+
+    def __init__(self, cfg: Config, db: DB, client: TelegramClient, on_event=None):
+        self.cfg = cfg
+        self.db = db
+        self.client = client
+        self.on_event = on_event or self._noop
+        self.task: asyncio.Task | None = None
+        self.campaign_id: int | None = None
+        self.multiplier = 1.0
+        self.waiting_until: float | None = None
+        self.wait_reason = ""
+        self._stop = asyncio.Event()
+
+    @staticmethod
+    async def _noop(*_args, **_kwargs) -> None:
+        return None
+
+    # ------------------------------------------------------------------ #
+    # lifecycle
+    # ------------------------------------------------------------------ #
+
+    @property
+    def running(self) -> bool:
+        return self.task is not None and not self.task.done()
+
+    def start(self, campaign_id: int) -> None:
+        if self.running:
+            raise RuntimeError("A campaign is already running")
+        self.campaign_id = campaign_id
+        self.multiplier = 1.0
+        self._stop = asyncio.Event()
+        self.task = asyncio.create_task(self._run(campaign_id))
+
+    def request_stop(self) -> None:
+        self._stop.set()
+
+    async def _sleep(self, seconds: float, reason: str) -> bool:
+        """Sleep, but wake early if someone pressed Stop. False => stop."""
+        seconds = max(0.0, seconds)
+        self.waiting_until = time.time() + seconds
+        self.wait_reason = reason
+        try:
+            await asyncio.wait_for(self._stop.wait(), timeout=seconds)
+            return False
+        except asyncio.TimeoutError:
+            return True
+        finally:
+            self.waiting_until = None
+            self.wait_reason = ""
+
+    # ------------------------------------------------------------------ #
+    # the loop
+    # ------------------------------------------------------------------ #
+
+    async def _run(self, campaign_id: int) -> None:
+        p = self.cfg.pacing
+        campaign = self.db.get_campaign(campaign_id)
+        text = campaign["text"]
+        parse_mode = campaign["parse_mode"]
+        delay = campaign["delay"]
+        sent_in_run = 0
+
+        try:
+            while True:
+                if self._stop.is_set():
+                    return await self._finish(campaign_id, "stopped", "Остановлено вручную")
+
+                recipient = self.db.next_pending(campaign_id)
+                if recipient is None:
+                    return await self._finish(campaign_id, "done", "")
+
+                # Re-derive the pace from what is actually left, so FLOOD_WAITs
+                # and manual pauses get absorbed instead of silently blowing
+                # through the deadline.
+                if sent_in_run and sent_in_run % REPLAN_EVERY == 0:
+                    remaining = self.db.progress(campaign_id).get("pending", 0)
+                    delay = build_plan(
+                        remaining, self.cfg.deadline, p, self.cfg.risk
+                    ).delay
+                    self.db.set_campaign_delay(campaign_id, delay)
+
+                if not await self._wait_out_quiet_hours():
+                    return await self._finish(campaign_id, "stopped", "Остановлено вручную")
+
+                if sent_in_run and sent_in_run % p.long_pause_every == 0:
+                    pause = random.uniform(p.long_pause_min, p.long_pause_max)
+                    if not await self._sleep(pause, "длинная пауза"):
+                        return await self._finish(campaign_id, "stopped", "Остановлено вручную")
+
+                if sent_in_run:
+                    gap = delay * self.multiplier
+                    gap *= random.uniform(1 - p.jitter, 1 + p.jitter)
+                    if not await self._sleep(gap, "интервал"):
+                        return await self._finish(campaign_id, "stopped", "Остановлено вручную")
+
+                outcome = await self._send_one(campaign_id, recipient, text, parse_mode)
+                if outcome == "hard_stop":
+                    return
+                if outcome == "sent":
+                    sent_in_run += 1
+                    self.multiplier = max(1.0, self.multiplier * 0.97)
+
+        except asyncio.CancelledError:
+            self.db.finish_campaign(campaign_id, "stopped", "Процесс остановлен")
+            raise
+        except Exception as exc:  # noqa: BLE001 - worker must not die silently
+            await self._finish(campaign_id, "failed", f"{type(exc).__name__}: {exc}")
+
+    async def _send_one(self, campaign_id, recipient, text, parse_mode) -> str:
+        peer = (
+            InputPeerUser(recipient.user_id, recipient.access_hash)
+            if recipient.access_hash is not None
+            else recipient.user_id
+        )
+        try:
+            await self.client.send_message(
+                peer, text, parse_mode=parse_mode, link_preview=True
+            )
+        except errors.FloodWaitError as exc:
+            self.multiplier = min(
+                self.cfg.pacing.flood_backoff_max,
+                self.multiplier * self.cfg.pacing.flood_backoff,
+            )
+            if exc.seconds > MAX_FLOOD_WAIT:
+                await self._finish(
+                    campaign_id,
+                    "stopped",
+                    f"FLOOD_WAIT {exc.seconds // 3600} ч — аккаунт ограничен. "
+                    f"Продолжать нельзя, проверь @SpamBot.",
+                )
+                return "hard_stop"
+            await self.on_event(
+                "flood", seconds=exc.seconds, multiplier=self.multiplier
+            )
+            # Resuming on the exact second the wait expires is itself a bot tell.
+            if not await self._sleep(exc.seconds + random.uniform(10, 60), "FLOOD_WAIT"):
+                await self._finish(campaign_id, "stopped", "Остановлено вручную")
+                return "hard_stop"
+            return "retry"
+        except ACCOUNT_ERRORS as exc:
+            await self._finish(
+                campaign_id,
+                "stopped",
+                f"{type(exc).__name__} — аккаунт ограничен или разлогинен. "
+                f"Рассылка остановлена, чтобы не сделать хуже. Проверь @SpamBot.",
+            )
+            return "hard_stop"
+        except PERMANENT_ERRORS as exc:
+            self.db.mark(campaign_id, recipient.user_id, "skipped", type(exc).__name__)
+            return "skipped"
+        except Exception as exc:  # noqa: BLE001 - one bad peer must not kill the run
+            self.db.mark(
+                campaign_id, recipient.user_id, "failed", f"{type(exc).__name__}: {exc}"
+            )
+            return "failed"
+
+        self.db.mark(campaign_id, recipient.user_id, "sent")
+        return "sent"
+
+    async def _wait_out_quiet_hours(self) -> bool:
+        p = self.cfg.pacing
+        while True:
+            now = datetime.now()
+            if not is_quiet(now.hour, p.quiet_start, p.quiet_end):
+                return True
+            resume = now.replace(hour=p.quiet_end, minute=0, second=0, microsecond=0)
+            if resume <= now:
+                resume += timedelta(days=1)
+            wait = (resume - now).total_seconds() + random.uniform(0, 600)
+            if not await self._sleep(wait, f"ночная пауза до {p.quiet_end:02d}:00"):
+                return False
+
+    async def _finish(self, campaign_id: int, status: str, reason: str) -> None:
+        self.db.finish_campaign(campaign_id, status, reason)
+        await self.on_event("finished", status=status, reason=reason, campaign_id=campaign_id)
+
+    # ------------------------------------------------------------------ #
+    # status
+    # ------------------------------------------------------------------ #
+
+    def snapshot(self) -> dict:
+        if self.campaign_id is None:
+            return {"running": False}
+        counts = self.db.progress(self.campaign_id)
+        campaign = self.db.get_campaign(self.campaign_id)
+        last_hour = self.db.sent_since(self.campaign_id, time.time() - 3600)
+        return {
+            "running": self.running,
+            "campaign_id": self.campaign_id,
+            "status": campaign["status"] if campaign else "unknown",
+            "stop_reason": campaign["stop_reason"] if campaign else None,
+            "counts": counts,
+            "delay": campaign["delay"] if campaign else None,
+            "multiplier": self.multiplier,
+            "last_hour": last_hour,
+            "waiting_for": (
+                max(0, self.waiting_until - time.time()) if self.waiting_until else 0
+            ),
+            "wait_reason": self.wait_reason,
+        }

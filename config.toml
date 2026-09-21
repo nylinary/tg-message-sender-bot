@@ -1,0 +1,42 @@
+[campaign]
+# Everything must be delivered by this moment (local time). The bot divides the
+# recipient count by the time left to work out the gap between messages.
+deadline = "2026-09-25T21:00:00"
+
+# Years offered as "last dialogue no older than N years" buttons in the panel.
+age_options = [1, 2, 3]
+
+[pacing]
+# Don't send between these local hours. Night sends annoy people, and annoyed
+# people press "Report spam", which is what actually gets accounts limited.
+quiet_start = 23
+quiet_end   = 10
+
+# Hard floor on the gap between two messages, in seconds. Not a policy cap —
+# below this Telegram simply answers with FLOOD_WAIT and you go slower overall.
+min_delay = 8.0
+
+# Randomise each gap by +/- this fraction so the cadence isn't machine-flat.
+jitter = 0.35
+
+# Pause for a while after every N messages.
+long_pause_every = 60
+long_pause_min   = 90
+long_pause_max   = 240
+
+# Multiply all later gaps by this after each FLOOD_WAIT, up to the cap.
+flood_backoff     = 1.5
+flood_backoff_max = 8.0
+
+[risk]
+# Messages per day above which the panel shows a warning. Advisory only —
+# the deadline still drives the actual rate.
+warn_per_day   = 300
+danger_per_day = 600
+
+[collect]
+# Re-scan dialogues automatically if the cached list is older than this.
+stale_after_hours = 6
+
+[files]
+state_dir = "state"
